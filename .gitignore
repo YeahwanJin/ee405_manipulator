@@ -1,0 +1,25 @@
+# 파이썬/컴파일 관련
+__pycache__/
+*.pyc
+.DS_Store
+__MACOSX/
+.vscode/
+
+# YOLO 모델 가중치 (이게 1.8GB의 주범입니다)
+*.pt
+*.pth
+*.weights
+*.onnx
+*.tflite
+
+# 데이터셋 및 영상
+*.mp4
+*.jpg
+*.png
+dataset/
+runs/
+
+# ROS2 빌드 폴더 (src 안에 있으면 안 되는데 있어서 무시 처리)
+build/
+install/
+log/
