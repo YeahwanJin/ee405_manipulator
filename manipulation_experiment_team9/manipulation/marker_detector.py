@@ -88,6 +88,7 @@ class MarkerDetector():
         aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         parameters = cv2.aruco.DetectorParameters()
         detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+ #       markerCorners, markerIds, rejected = cv2.aruco.detectMarkers(rgb_image, aruco_dict, # parameters)
 
         markerCorners, markerIds, _ = detector.detectMarkers(gray)
         if markerIds is None or len(markerIds) == 0:

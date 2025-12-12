@@ -62,7 +62,7 @@ class NavigationController(Node):
     def get_image(self):
         return self.latest_image
 
-    def move_to_coordinate(self, x, y, w=1.0):
+    def move_to_coordinate(self, x, y, z=-0.7124031163741047, w=0.7017704751415977):
         print(f"Waiting for Nav2 server... (Target: {x}, {y})")
         
         # 서버 연결 확인
@@ -75,7 +75,8 @@ class NavigationController(Node):
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position.x = float(x)
         goal_msg.pose.pose.position.y = float(y)
-        goal_msg.pose.pose.orientation.w = w
+        goal_msg.pose.pose.orientation.z = float(z)
+        goal_msg.pose.pose.orientation.w = float(w)
 
         print("Sending goal...")
         send_goal_future = self._action_client.send_goal_async(goal_msg)
@@ -106,10 +107,11 @@ class SmartMission:
         self.nav = nav_node  # 네비게이션 컨트롤러를 받아서 씀
         self.grasp = grasp_node
         self.world_map = {
-            "loc_1": {"coords": (1.0, 1.0), "zone_id": None, "cube_color": None},
-            "loc_2": {"coords": (2.0, 2.0), "zone_id": None, "cube_color": None},
-            "loc_3": {"coords": (3.0, 3.0), "zone_id": None, "cube_color": None}
+            "loc_1": {"coords": (0.22586322614275445, -0.7200596135971158), "zone_id": None, "cube_color": None},
+            "loc_2": {"coords": (-0.9819009900093079, -1.2106988430023193), "zone_id": None, "cube_color": None},
+            "loc_3": {"coords": (-2.126121997833252, -1.3567204475402832), "zone_id": None, "cube_color": None}
         }
+        self.task_queue = task_queue
         
         # [Import MarkerDetector]
         # Adding path to manipulation_experiment_team9 for MarkerDetector
@@ -137,11 +139,11 @@ class SmartMission:
         # [Step 1] 사용자 입력 및 LLM 계획 수립
         user_prompt = input("Enter Task Prompt: ")
         # 여기서 실제 LLM 모듈을 호출해야 함 (지금은 더미 함수 사용)
-        self.task_queue = self.generate_plan_from_llm(user_prompt)
+    #    self.task_queue = self.generate_plan_from_llm(user_prompt)
         
         # [Step 2] Phase 1: 똑똑한 탐색 (loc_3 생략 로직 포함)
         print("\n--- [Phase 1] Start Smart Exploration ---")
-        search_order = ["loc_1", "loc_2"] # 3은 뺌!
+        search_order = ["loc_1", "loc_2", "loc_3"]
         
         for key in search_order:
             self.visit_and_scan(key) # 이동 및 스캔 함수 분리 추천
@@ -150,7 +152,7 @@ class SmartMission:
         active_colors = [c for c in possible_colors if c in user_prompt.lower()]
         
         # [Step 3] 추론 (Inference)
-        self.perform_deduction(active_colors) # loc_3 정보 채우기
+      #  self.perform_deduction(active_colors) # loc_3 정보 채우기
         
         # [Step 4] Phase 2: 실행 (Map + Task 결합)
         self.run_phase_2_execution()
@@ -180,8 +182,9 @@ class SmartMission:
         max_retries = 2
         for attempt in range(max_retries + 1):
             print(f">> Scanning {loc_key} (Attempt {attempt+1}/{max_retries+1})...")
-            time.sleep(1.0) # 로봇/카메라 안정화
-
+            time.sleep(5.0) # 로봇/카메라 안정화
+            
+            
             # 3. 이미지 획득
             img = self.nav.get_image()
             if img is None:
@@ -235,7 +238,7 @@ class SmartMission:
                         target_q[3] -= 0.2 
                         print(f"   Move Joint 4: {current_q[3]:.2f} -> {target_q[3]:.2f}")
                         self.grasp.set_joint_positions(target_q, 1.0)
-                        time.sleep(1.0)
+                        time.sleep(5.0)
                     except Exception as e:
                         print(f"   !! Tilt failed: {e}")
                 else:
