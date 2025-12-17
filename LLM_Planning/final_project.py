@@ -461,7 +461,17 @@ class SmartMission:
                     coords = self.world_map[target_loc]["coords"]
                     print(f"   -> Found Zone {zone} at {target_loc} {coords}. Moving...")
                     self.nav.move_to_coordinate(*coords)
-                    
+                    # Move forward ~10cm using joint control (bypass Nav2)
+                    try:
+                        current_q = self.grasp.get_joint_positions()
+                        target_q = current_q.copy()
+                        # Adjust joint 2 (index 1) forward; value may need tuning
+                        target_q[1] += 0.1
+                        self.grasp.set_joint_positions(target_q, 1.0)
+                        time.sleep(1.0)
+                    except Exception as e:
+                        print(f"   !! Failed to move forward 10cm: {e}")
+
                     # Place
                     action_name = place_map.get(holding_color)
                     if action_name:
