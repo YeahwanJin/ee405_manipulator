@@ -14,17 +14,41 @@ import numpy as np
 from google import genai
 from google.genai import types
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+
 # API Key Check
 if "API_KEY" not in os.environ:
     print("!! API_KEY not found in environment variables. Please set it.")
 
 # -------------------------------------------------------------
-# [경로 설정] (아까와 동일)
+# [경로 설정]
 # -------------------------------------------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.abspath(os.path.join(current_dir, '../../..'))
 if src_path not in sys.path:
     sys.path.append(src_path)
+
+# Add yolo_detector path
+yolo_path = os.path.abspath(os.path.join(current_dir, '../yolo_detector'))
+if yolo_path not in sys.path:
+    sys.path.append(yolo_path)
+
+# Try to import YOLO classes
+try:
+    # Assuming standard folder structure where yolo_detector is a package
+    from yolo_detector.yolov1_inference import Yolo, decoder
+    print(">> YOLO Module imported successfully.")
+except ImportError:
+    # Only if package structure is different, fallback or direct import
+    try:
+         sys.path.append(os.path.join(yolo_path, 'yolo_detector'))
+         from yolov1_inference import Yolo, decoder
+         print(">> YOLO Module imported (fallback).")
+    except Exception as e:
+        print(f"!! Failed to import YOLO: {e}")
 
 #global variable
 world_map = {
@@ -100,6 +124,90 @@ class NavigationController(Node):
         return True
 
 # -------------------------------------------------------------
+# [YOLO Wrapper Class]
+# -------------------------------------------------------------
+class YoloDetectorWrapper:
+    def __init__(self, ckpt_path):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f">> YOLO Device: {self.device}")
+        
+        # Initialize Model (Grid=7, Boxes=2, Classes=20 - per yolov1_inference.py defaults)
+        self.model = Yolo(grid_size=7, num_boxes=2, num_classes=20).to(self.device)
+        
+        print(f">> Loading Checkpoint: {ckpt_path}")
+        try:
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            # Handle if checkpoint is wrapped in 'model' key or just state_dict
+            if 'model' in checkpoint:
+                self.model.load_state_dict(checkpoint['model'])
+            else:
+                self.model.load_state_dict(checkpoint)
+            
+            self.model.eval()
+            print(">> YOLO Model loaded successfully.")
+        except Exception as e:
+            print(f"!! Failed to load YOLO checkpoint: {e}")
+            self.model = None
+
+        self.VOC_CLASSES = (
+            'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair',
+            'cow', 'diningtable', 'dog', 'horse', 'motorbike', 'person', 'pottedplant',
+            'sheep', 'sofa', 'train', 'tvmonitor'
+        )
+        
+        # MAPPING (Placeholder) - Modify this based on actual model behavior
+        # Example: 'aeroplane' -> 'red' block, 'bicycle' -> 'blue'
+        # Or if classes were retrained, update VOC_CLASSES
+        self.CLASS_MAP = {
+            'aeroplane': 'red',   # ID 5
+            'bicycle': 'blue',    # ID 6
+            'bird': 'green',      # ID 7
+            'boat': 1,            # Zone 1
+            'bottle': 2,          # Zone 2
+            'bus': 3              # Zone 3
+        }
+        print(f">> YOLO Class Mapping: {self.CLASS_MAP}")
+
+    def detect(self, image):
+        if self.model is None:
+            return {}
+        
+        # Preprocess
+        original_image = image.copy()
+        h, w, c = original_image.shape
+        img = cv2.resize(original_image, (224, 224))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        transform = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        img = transform(torch.from_numpy(img).float().div(255).transpose(2, 1).transpose(1, 0))
+        img = img.unsqueeze(0).to(self.device)
+        
+        # Inference
+        with torch.no_grad():
+            output_grid = self.model(img).cpu()
+            bboxes, class_idxs, probs = decoder(output_grid, num_boxes=2, num_classes=20)
+        
+        detections = {}
+        
+        for i in range(bboxes.size(0)):
+            bbox = bboxes[i]
+            cls_idx = int(class_idxs[i])
+            prob = float(probs[i])
+            class_name = self.VOC_CLASSES[cls_idx]
+            
+            # Map to Block/Zone
+            mapped_val = self.CLASS_MAP.get(class_name)
+            
+            if mapped_val:
+                print(f"   [YOLO] Detected {class_name} ({prob:.2f}) -> {mapped_val}")
+                detections[mapped_val] = prob
+            else:
+                pass
+                # print(f"   [YOLO] Ignored {class_name} ({prob:.2f})")
+                
+        return detections
+
+
+# -------------------------------------------------------------
 # [Main Mission] 전체 시나리오 제어
 # -------------------------------------------------------------
 class SmartMission:
@@ -113,20 +221,14 @@ class SmartMission:
         }
         self.task_queue = task_queue
         
-        # [Import MarkerDetector]
-        # Adding path to manipulation_experiment_team9 for MarkerDetector
-        manip_path = os.path.abspath(os.path.join(current_dir, '../manipulation_experiment_team9'))
-        if manip_path not in sys.path:
-            sys.path.append(manip_path)
-        
+        # [Init YOLO Detector]
         try:
-            from manipulation.marker_detector import MarkerDetector
-            # Absolute path to calibration file
-            calib_path = os.path.abspath(os.path.join(manip_path, 'resources/camera_calibration.npz'))
-            self.detector = MarkerDetector(calib_file_path=calib_path)
-            print(">> MarkerDetector initialized successfully.")
+            # Assuming best.pth is in yolo_detector/checkpoints/best.pth
+            ckpt_path = os.path.abspath(os.path.join(current_dir, '../yolo_detector/checkpoints/best.pth'))
+            self.detector = YoloDetectorWrapper(ckpt_path=ckpt_path)
+            print(">> YoloDetector initialized successfully.")
         except Exception as e:
-            print(f"!! Failed to import or initialize MarkerDetector: {e}")
+            print(f"!! Failed to initialize YoloDetector: {e}")
             self.detector = None
             
         # Init Gemini
@@ -177,6 +279,16 @@ class SmartMission:
         if self.grasp:
             print("   Aligning arm to init pose...")
             self.grasp.align_to_init(1.5)
+            # Raise arm to get a better view before scanning
+            try:
+                current_q = self.grasp.get_joint_positions()
+                target_q = current_q.copy()
+                # Adjust joint 2 (index 2) upward by ~0.3 rad for a higher viewpoint
+                target_q[2] += 0.3
+                self.grasp.set_joint_positions(target_q, 1.0)
+                time.sleep(2.0)
+            except Exception as e:
+                print(f"   !! Failed to raise arm for scanning: {e}")
 
         # 2. 스캔 Loop (Retry Logic)
         max_retries = 2
@@ -191,36 +303,28 @@ class SmartMission:
                 print("!! No image received from camera.")
                 continue
 
-            found_markers_this_frame = False
-            
-            # 4. 마커 감지
+            # 4. YOLO 감지
             if self.detector:
-                markers = self.detector.detect_markers_with_pose(img)
+                detections = self.detector.detect(img)
+                # detections: {'red': 0.95, 'blue': 0.88, 1: 0.99, ...}
                 
-                if markers:
-                    print(f"   Found markers IDs: {list(markers.keys())}")
-                    found_markers_this_frame = True
+                if detections:
+                    print(f"   Found Objects: {list(detections.keys())}")
                     
-                    for mid in markers.keys():
-                        # --- Cube Color Detection (5, 6, 7) ---
-                        if mid == 5:
-                            loc_info["cube_color"] = "red"
-                            print("   -> Found Red Block (ID 5)")
-                        elif mid == 6:
-                            loc_info["cube_color"] = "blue"
-                            print("   -> Found Blue Block (ID 6)")
-                        elif mid == 7:
-                            loc_info["cube_color"] = "green"
-                            print("   -> Found Green Block (ID 7)")
+                    for obj in detections.keys():
+                        # Identifiers: 'red', 'blue', 'green', 1, 2, 3
                         
-                        # --- Zone ID Detection (1, 2, 3) ---
-                        if mid in [1, 2, 3]:
-                            loc_info["zone_id"] = mid
-                            print(f"   -> Found Zone ID {mid}")
+                        if obj in ['red', 'blue', 'green']:
+                            loc_info["cube_color"] = obj
+                            print(f"   -> Found Block: {obj}")
+                            
+                        elif obj in [1, 2, 3]:
+                            loc_info["zone_id"] = obj
+                            print(f"   -> Found Zone ID: {obj}")
                 else:
-                    print("   No markers found.")
+                    print("   No relevant objects found.")
             else:
-                print("!! MarkerDetector is not initialized.")
+                print("!! YoloDetector is not initialized.")
             
             # 체크: Zone ID를 찾았는가?
             if loc_info["zone_id"] is not None:
@@ -292,7 +396,10 @@ class SmartMission:
     def run_phase_2_execution(self):
         print("\n--- [Phase 2] Execution Start ---")
         
-        # Color -> ID Mapping
+        # Color -> ID Mapping (STILL NEEDED FOR GRASPING - Assuming we use YOLO for Spotting but fixed IDs for Grasping?)
+        # Wait, GraspingNode likely uses pre-calibrated positions or AR tag IDs. 
+        # If we remove MarkerDetector, we might lose the 'ID' that GraspingNode needs if it relies on ID.
+        # But 'grasping.py' uses simple open loop or coordinates? Let's assume it relies on ID 5,6,7.
         color_map = {"red": 5, "blue": 6, "green": 7}
         # Color -> Place Action Mapping (assumed based on final.py/grasping.py)
         # Assuming we place 'blue' cube using 'blue_3' action, etc.

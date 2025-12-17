@@ -15,7 +15,7 @@ class GraspingNode(GraspingNodeBase):
         self.running = True
         
         # [j1, j2, j3, j4, j5]
-        self.q_init = np.array([0.0, -0.8, 1.5, 1.7, 0.0], dtype=float)
+        self.q_init = np.array([0.0, -1.1, 1.7, 1.7, 0.0], dtype=float)
 
         # 필요하면 “내가 마지막에 보낸 값”만 추적하고 쓸 수도 있음
         self.last_q = None
@@ -100,36 +100,29 @@ class GraspingNode(GraspingNodeBase):
         - 현재 로봇 상태는 IK에 안 씀
         - 항상 self.q_init 에서 IK 풀어서 보냄
         """
+    def grasp_pose(self, T_world_block) -> bool:
+        """
+        Executes the grasping sequence for a given target pose T_world_block.
+        """
         is_success = False
 
         # (옵션) 시작할 때 실제 로봇도 q_init으로 맞춰두고 싶으면 이거 켜기
-        self.align_to_init()
+    #    self.align_to_init()
 
         # 0) 그리퍼 열기
         self.gripper_open(1.0)
-
-        # 1) 마커 탐색
-        detection_result = None
-        t0 = time.time()
-        while time.time() - t0 < 3.0:
-            det = self.get_detected_markers()
-            if target_marker_id in det:
-                detection_result = det[target_marker_id]
-                break
-            time.sleep(0.05)
-        if detection_result is None:
-            print("[GRASP] marker not found")
-            return False
-
-        # 2) 마커 → 월드 블록 포즈
-        T_block_from_cam = self.get_block_pose(detection_result)
         
         R_grasp_top_down = np.array([
             [1.,  0.,  0.],
             [0., -1.,  0.],
             [0.,  0., -1.]], dtype = jnp.float64)
             
-        p_target = T_block_from_cam[:3, 3]
+        p_target = T_world_block[:3, 3]
+        
+        # [MODIFIED] Add manual Z-offset (3cm down)
+        # Because robot often grasps too high.
+        p_target[2] -= 0.03 
+        
         T_block= np.eye(4)
         T_block[:3, :3] = R_grasp_top_down
         T_block[:3, 3] = p_target
@@ -154,40 +147,29 @@ class GraspingNode(GraspingNodeBase):
         T_lift = translate_z(T_block, +LIFT_DZ)
 
         # 5) 항상 같은 초기값으로 IK
-        q0 = self.q_init.copy()
+        q0 = self.get_joint_positions()
         print("\n[IK] q_init used:", q0)
 
-        # 5-1) 접근
-        sol_app = inverse_kinematics(q0, T_app)
-        print("[IK] T_block_from_cam:\n", T_block_from_cam)
-        print("[IK] T_app:\n", T_app)
-        print("[IK] sol_app:\n", sol_app)
-        if not sol_app or sol_app["sol"] is None:
-            print("[GRASP] IK for approach failed")
-            return False
-        q_app = self._wrap_to_pi(sol_app["sol"])
-        print("[IK] q_app:", q_app, "err:", sol_app["pos_error"])
-        pos_error_app = sol_app["pos_error"]
-        if pos_error_app < 0.02:
-            self.set_joint_positions(q_app, 1.2)
-            time.sleep(1.2)
-        else:
-            print("IK solution error too high.")
-            return False
-
-        # 5-2) 내려오기
-        sol_grasp = inverse_kinematics(q_app, T_block)
+        # [MODIFIED] Two-step logic: Approach & Grasp (Merged), then Lift.
+        # We skip the intermediate physical stop at T_app.
+        
+        # 5-2) 내려오기 (Directly to Grasp Pose)
+        # We use q0 as seed.
+        sol_grasp = inverse_kinematics(q0, T_block)
         print("[IK] T_block:\n", T_block)
-        print("[IK] sol_grasp:", sol_grasp)
         if not sol_grasp or sol_grasp["sol"] is None:
             print("[GRASP] IK for block failed")
             return False
+            
         q_grasp = self._wrap_to_pi(sol_grasp["sol"])
         print("[IK] q_grasp:", q_grasp, "err:", sol_grasp["pos_error"])
+        
         pos_error_grasp = sol_grasp["pos_error"]
-        if pos_error_grasp < 0.04:
-            self.set_joint_positions(q_grasp, 1.0)
-            time.sleep(1.0)
+        if pos_error_grasp < 0.1:
+            print("Moving to Grasp Pose...")
+            # Slower speed for safety since it's a longer move
+            self.set_joint_positions(q_grasp, 2.0) 
+            time.sleep(2.0)
         else:
             print("IK solution error too high.")
             return False
@@ -206,7 +188,7 @@ class GraspingNode(GraspingNodeBase):
         q_lift = self._wrap_to_pi(sol_lift["sol"])
         print("[IK] q_lift:", q_lift, "err:", sol_lift["pos_error"])
         pos_error_lift = sol_lift["pos_error"]
-        if pos_error_lift < 0.04:
+        if pos_error_lift < 0.1:
             self.set_joint_positions(q_lift, 1.0)
             time.sleep(1.0)
         else:
@@ -217,6 +199,30 @@ class GraspingNode(GraspingNodeBase):
         self.last_q = q_lift.copy()
         is_success = True
         return is_success
+
+    def grasp(self, target_marker_id: int | str) -> bool:
+        """
+        완전 새 구조:
+        - 현재 로봇 상태는 IK에 안 씀
+        - 항상 self.q_init 에서 IK 풀어서 보냄
+        """
+        # 1) 마커 탐색
+        detection_result = None
+        t0 = time.time()
+        while time.time() - t0 < 3.0:
+            det = self.get_detected_markers()
+            if target_marker_id in det:
+                detection_result = det[target_marker_id]
+                break
+            time.sleep(0.05)
+        if detection_result is None:
+            print("[GRASP] marker not found")
+            return False
+
+        # 2) 마커 → 월드 블록 포즈
+        T_block_from_cam = self.get_block_pose(detection_result)
+        
+        return self.grasp_pose(T_block_from_cam)
 
     # =====================================================================
     # 4) place 도 q_init 기반으로

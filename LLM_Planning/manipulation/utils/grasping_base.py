@@ -36,14 +36,19 @@ class GraspingNodeBase(Node):
 
         # For Marker detection 
         self.image_sub = self.create_subscription(Image, '/depth_cam/rgb/image_raw', self.image_callback, 1)
+        self.depth_sub = self.create_subscription(Image, '/depth_cam/depth/image_raw', self.depth_callback, 1)
         self.bridge = CvBridge()
         self.image = None
+        self.depth_image = None
         
         self.marker_detector = MarkerDetector()
         self.marker_ids = {"red" : 1, "blue" : 6, "green" : 7}
     
     def image_callback(self, msg):
         self.image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+    def depth_callback(self, msg):
+        self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
     def get_joint_positions_pulse(self):
         try:
