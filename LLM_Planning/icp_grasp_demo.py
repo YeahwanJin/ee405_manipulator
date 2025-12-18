@@ -15,8 +15,8 @@ from manipulation.utils.icp_utils import ICPPoseEstimator
 
 # --- CONFIGURATION ---
 OBJECTS = ["orange toy block", "red toy block", "green toy block", "blue toy block", "bird", "chair", "horse", "person"]
-THRESHOLD = 0.05
-GRASP_SCORE_THRESHOLD = 0.05
+THRESHOLD = 0.1
+GRASP_SCORE_THRESHOLD = 0.1
 
 # Camera Intrinsics 
 FX = 607.0

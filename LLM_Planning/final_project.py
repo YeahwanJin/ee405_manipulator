@@ -3,25 +3,70 @@ import os
 import time
 import re
 import ast
+import json
+import requests
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 from google import genai
 from google.genai import types
+from PIL import Image as PILImage
+import google.generativeai as genai_sdk
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import transforms
+# NanoOWL & ICP imports
+from nanoowl.owl_predictor import OwlPredictor
+from manipulation.kinematics import forward_kinematics
+from manipulation.utils.icp_utils import ICPPoseEstimator
 
 # API Key Check
 if "API_KEY" not in os.environ:
     print("!! API_KEY not found in environment variables. Please set it.")
+
+# Voice Server Configuration
+VOICE_SERVER_URL = "https://localhost:5000"
+
+def get_voice_command(timeout=60):
+    """
+    Wait for voice command from the voice server.
+    Returns the command text or None if timeout/error.
+    """
+    print(f"\n🎤 Waiting for voice command... (timeout: {timeout}s)")
+    print(f"   Open {VOICE_SERVER_URL} in your browser to speak commands.")
+    print(f"   Or press Ctrl+C to use keyboard input.\n")
+    
+    start_time = time.time()
+    poll_interval = 1.0  # seconds
+    
+    try:
+        while (time.time() - start_time) < timeout:
+            try:
+                # verify=False for self-signed certificate
+                response = requests.get(f"{VOICE_SERVER_URL}/get_command", timeout=2, verify=False)
+                data = response.json()
+                
+                if data.get("status") == "ok" and data.get("command"):
+                    text = data["command"]["text"]
+                    print(f"📥 Voice Command Received: '{text}'")
+                    return text
+                    
+            except requests.exceptions.RequestException:
+                # Server not running, skip silently
+                pass
+            
+            time.sleep(poll_interval)
+        
+        print("⏰ Voice command timeout.")
+        return None
+        
+    except KeyboardInterrupt:
+        print("\n⌨️  Switching to keyboard input...")
+        return None
 
 # -------------------------------------------------------------
 # [경로 설정]
@@ -30,25 +75,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.abspath(os.path.join(current_dir, '../../..'))
 if src_path not in sys.path:
     sys.path.append(src_path)
-
-# Add yolo_detector path
-yolo_path = os.path.abspath(os.path.join(current_dir, '../yolo_detector'))
-if yolo_path not in sys.path:
-    sys.path.append(yolo_path)
-
-# Try to import YOLO classes
-try:
-    # Assuming standard folder structure where yolo_detector is a package
-    from yolo_detector.yolov1_inference import Yolo, decoder
-    print(">> YOLO Module imported successfully.")
-except ImportError:
-    # Only if package structure is different, fallback or direct import
-    try:
-         sys.path.append(os.path.join(yolo_path, 'yolo_detector'))
-         from yolov1_inference import Yolo, decoder
-         print(">> YOLO Module imported (fallback).")
-    except Exception as e:
-        print(f"!! Failed to import YOLO: {e}")
 
 #global variable
 world_map = {
@@ -65,12 +91,112 @@ task_queue = [
 #
 
 # -------------------------------------------------------------
+# [LLM Planner] - Improved Task Planner with Dynamic Map
+# -------------------------------------------------------------
+LLM_SYSTEM_PROMPT = """
+You are the Task Planner for a mobile manipulator robot.
+Your goal is to convert a Natural Language Instruction into a JSON sequence of atomic actions.
+
+### INPUT DATA:
+You will be provided with:
+1. **Map Configuration:** Which visual marker (e.g., bird, chair, horse) is in which Zone.
+2. **World State:** Which block (red, green, blue) is in which Zone.
+3. **Instruction:** The task to perform.
+
+### AVAILABLE ACTIONS:
+1. `navigate(target)`: Go to 'zone_1', 'zone_2', 'zone_3', or 'start_point'.
+2. `pick(target)`: Pick up 'red_block', 'green_block', or 'blue_block'.
+3. `place(target)`: Place the held object at a zone ('zone_1', 'zone_2', 'zone_3').
+4. `say(text)`: Speak text aloud.
+
+### LOGIC RULES:
+- **Resolve Targets:** If instruction says "zone with the Bird", look at Map Configuration to find the Zone ID.
+- **Conditional Logic:** If instruction says "If there is a cube...", check the World State.
+- **Switching:** A "switch" or "swap" requires a temporary place location.
+
+### OUTPUT FORMAT:
+Output ONLY a valid JSON list.
+Example: [{"action": "navigate", "target": "zone_2"}, {"action": "pick", "target": "red_block"}]
+"""
+
+class LLMPlanner:
+    """Improved LLM Planner with dynamic map configuration support."""
+    
+    def __init__(self, api_key):
+        genai_sdk.configure(api_key=api_key)
+        self.model = genai_sdk.GenerativeModel(
+            'gemini-1.5-flash',
+            system_instruction=LLM_SYSTEM_PROMPT
+        )
+        print(">> LLMPlanner initialized with gemini-1.5-flash")
+    
+    def generate_plan(self, instruction, map_config, block_state):
+        """
+        Generate plan based on dynamic map configuration.
+        
+        Args:
+            instruction: Natural language task instruction
+            map_config: dict (e.g., {"zone_1": "horse", "zone_2": "chair", "zone_3": "bird"})
+            block_state: dict (e.g., {"red_block": "zone_1", "green_block": "zone_3"})
+        
+        Returns:
+            List of action dictionaries
+        """
+        prompt = f"""
+### 1. DYNAMIC MAP CONFIGURATION (Visual Markers):
+{json.dumps(map_config, indent=2)}
+
+### 2. CURRENT WORLD STATE (Blocks):
+{json.dumps(block_state, indent=2)}
+
+### 3. INSTRUCTION:
+"{instruction}"
+
+Generate the execution plan JSON.
+"""
+        
+        print(f">> LLM Planning for: '{instruction}'")
+        print(f"   Map Config: {map_config}")
+        print(f"   Block State: {block_state}")
+        
+        try:
+            response = self.model.generate_content(prompt)
+            text = response.text.strip()
+            print(f"   LLM Raw Response: {text}")
+            
+            # Clean up markdown code blocks if present
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("\n", 1)[0]
+            
+            # Parse JSON
+            plan = json.loads(text)
+            print(f"   Parsed Plan: {plan}")
+            return plan
+            
+        except json.JSONDecodeError as e:
+            print(f"!! JSON Parse Error: {e}")
+            # Try regex fallback
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except:
+                    pass
+            return []
+        except Exception as e:
+            print(f"!! LLM Error: {e}")
+            return []
+
+# -------------------------------------------------------------
 # [Nav Class] 기존 코드 + "기다리기(Blocking)" 기능 추가
 # -------------------------------------------------------------
 class NavigationController(Node):
     def __init__(self):
         super().__init__('navigation_controller')
         self._action_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+
+        # [cmd_vel] Publisher for direct velocity control
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # [Vision] Image Subscriber
         self.bridge = CvBridge()
@@ -86,8 +212,26 @@ class NavigationController(Node):
     def get_image(self):
         return self.latest_image
 
-    def move_to_coordinate(self, x, y, z=-0.7124031163741047, w=0.7017704751415977):
-        print(f"Waiting for Nav2 server... (Target: {x}, {y})")
+    def move_to_coordinate(self, x, y, yaw=None):
+        """
+        Navigate to coordinate (x, y) facing toward the target.
+        
+        Args:
+            x, y: Target coordinates
+            yaw: Optional specific yaw angle in radians. 
+                 If None, automatically faces toward target from origin.
+        """
+        import math
+        
+        # Calculate yaw to face the target from origin (0, 0)
+        if yaw is None:
+            yaw = math.atan2(y, x)
+        
+        # Convert yaw to quaternion (only z and w needed for 2D)
+        qz = math.sin(yaw / 2.0)
+        qw = math.cos(yaw / 2.0)
+        
+        print(f"Waiting for Nav2 server... (Target: {x}, {y}, yaw: {math.degrees(yaw):.1f}°)")
         
         # 서버 연결 확인
         if not self._action_client.wait_for_server(timeout_sec=5.0):
@@ -99,8 +243,8 @@ class NavigationController(Node):
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position.x = float(x)
         goal_msg.pose.pose.position.y = float(y)
-        goal_msg.pose.pose.orientation.z = float(z)
-        goal_msg.pose.pose.orientation.w = float(w)
+        goal_msg.pose.pose.orientation.z = float(qz)
+        goal_msg.pose.pose.orientation.w = float(qw)
 
         print("Sending goal...")
         send_goal_future = self._action_client.send_goal_async(goal_msg)
@@ -123,88 +267,175 @@ class NavigationController(Node):
         print('Arrived at destination!')
         return True
 
-# -------------------------------------------------------------
-# [YOLO Wrapper Class]
-# -------------------------------------------------------------
-class YoloDetectorWrapper:
-    def __init__(self, ckpt_path):
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f">> YOLO Device: {self.device}")
+    def move_forward(self, distance_m, speed=0.1):
+        """
+        cmd_vel을 사용하여 로봇을 지정된 거리만큼 전진시킵니다.
+        MPPI 없이 직접 속도 명령을 보냅니다.
         
-        # Initialize Model (Grid=7, Boxes=2, Classes=20 - per yolov1_inference.py defaults)
-        self.model = Yolo(grid_size=7, num_boxes=2, num_classes=20).to(self.device)
+        Args:
+            distance_m: 전진 거리 (미터)
+            speed: 전진 속도 (m/s), 기본값 0.1
+        """
+        duration = distance_m / speed
+        print(f"   >> Moving forward {distance_m*100:.1f}cm using cmd_vel (duration: {duration:.1f}s)...")
         
-        print(f">> Loading Checkpoint: {ckpt_path}")
-        try:
-            checkpoint = torch.load(ckpt_path, map_location=self.device)
-            # Handle if checkpoint is wrapped in 'model' key or just state_dict
-            if 'model' in checkpoint:
-                self.model.load_state_dict(checkpoint['model'])
-            else:
-                self.model.load_state_dict(checkpoint)
-            
-            self.model.eval()
-            print(">> YOLO Model loaded successfully.")
-        except Exception as e:
-            print(f"!! Failed to load YOLO checkpoint: {e}")
-            self.model = None
+        twist = Twist()
+        twist.linear.x = speed
+        twist.angular.z = 0.0
+        
+        start_time = time.time()
+        while (time.time() - start_time) < duration:
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(0.05)  # 20Hz
+        
+        # 정지
+        twist.linear.x = 0.0
+        self.cmd_vel_pub.publish(twist)
+        print("   >> Forward movement complete.")
 
-        self.VOC_CLASSES = (
-            'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair',
-            'cow', 'diningtable', 'dog', 'horse', 'motorbike', 'person', 'pottedplant',
-            'sheep', 'sofa', 'train', 'tvmonitor'
+# -------------------------------------------------------------
+# [NanoOWL Detector Class] - ICP 기반 pose estimation 포함
+# -------------------------------------------------------------
+# Camera Intrinsics
+FX = 607.0
+FY = 607.0
+CX = 320.0
+CY = 240.0
+INTRINSICS = (FX, FY, CX, CY)
+
+OBJECTS = ["orange toy block", "red toy block", "green toy block", "blue toy block", "bird", "chair", "horse"]
+THRESHOLD = 0.1
+GRASP_SCORE_THRESHOLD = 0.1
+
+class NanoOwlDetector:
+    def __init__(self):
+        print(">> Loading NanoOWL AI Engine...")
+        self.predictor = OwlPredictor(
+            "google/owlvit-base-patch32",
+            image_encoder_engine="/home/ubuntu/ros2_ws/src/nanoowl/data/owl_image_encoder_patch32.engine"
         )
         
-        # MAPPING (Placeholder) - Modify this based on actual model behavior
-        # Example: 'aeroplane' -> 'red' block, 'bicycle' -> 'blue'
-        # Or if classes were retrained, update VOC_CLASSES
-        self.CLASS_MAP = {
-            'aeroplane': 'red',   # ID 5
-            'bicycle': 'blue',    # ID 6
-            'bird': 'green',      # ID 7
-            'boat': 1,            # Zone 1
-            'bottle': 2,          # Zone 2
-            'bus': 3              # Zone 3
+        print(f">> Encoding text labels: {OBJECTS}")
+        self.text_encodings = self.predictor.encode_text(OBJECTS)
+        
+        # Initialize ICP Estimator
+        self.icp_estimator = ICPPoseEstimator(cube_size=0.035, num_points=2000)
+        
+        # Color mapping from object labels (for blocks)
+        self.COLOR_MAP = {
+            "orange toy block": "orange",
+            "red toy block": "red",
+            "green toy block": "green",
+            "blue toy block": "blue"
         }
-        print(f">> YOLO Class Mapping: {self.CLASS_MAP}")
+        
+        # Zone mapping from zone markers (bird -> zone 1, chair -> zone 2, horse -> zone 3)
+        self.ZONE_MAP = {
+            "bird": 1,
+            "chair": 2,
+            "horse": 3
+        }
+        print(">> NanoOwlDetector initialized successfully.")
 
     def detect(self, image):
-        if self.model is None:
-            return {}
+        """
+        NanoOWL을 사용하여 블록과 Zone 감지. 색상/Zone ID와 신뢰도 반환.
+        """
+        img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img_pil = PILImage.fromarray(img_rgb)
         
-        # Preprocess
-        original_image = image.copy()
-        h, w, c = original_image.shape
-        img = cv2.resize(original_image, (224, 224))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        transform = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        img = transform(torch.from_numpy(img).float().div(255).transpose(2, 1).transpose(1, 0))
-        img = img.unsqueeze(0).to(self.device)
+        output = self.predictor.predict(
+            image=img_pil,
+            text=OBJECTS,
+            text_encodings=self.text_encodings,
+            threshold=THRESHOLD
+        )
         
-        # Inference
-        with torch.no_grad():
-            output_grid = self.model(img).cpu()
-            bboxes, class_idxs, probs = decoder(output_grid, num_boxes=2, num_classes=20)
+        detections = {
+            'blocks': {},  # 블록 감지 결과
+            'zones': {}    # Zone 감지 결과
+        }
         
-        detections = {}
-        
-        for i in range(bboxes.size(0)):
-            bbox = bboxes[i]
-            cls_idx = int(class_idxs[i])
-            prob = float(probs[i])
-            class_name = self.VOC_CLASSES[cls_idx]
-            
-            # Map to Block/Zone
-            mapped_val = self.CLASS_MAP.get(class_name)
-            
-            if mapped_val:
-                print(f"   [YOLO] Detected {class_name} ({prob:.2f}) -> {mapped_val}")
-                detections[mapped_val] = prob
-            else:
-                pass
-                # print(f"   [YOLO] Ignored {class_name} ({prob:.2f})")
+        for i, score in enumerate(output.scores):
+            if score > GRASP_SCORE_THRESHOLD:
+                label = OBJECTS[output.labels[i]]
+                box = output.boxes[i]
                 
+                # 블록 감지
+                if "block" in label:
+                    color = self.COLOR_MAP.get(label, label)
+                    print(f"   [NanoOWL] Detected {label} (score: {score:.2f}) -> {color}")
+                    detections['blocks'][color] = {
+                        'score': float(score),
+                        'box': [int(v) for v in box]
+                    }
+                
+                # Zone 마커 감지 (bird, chair, horse)
+                elif label in self.ZONE_MAP:
+                    zone_id = self.ZONE_MAP[label]
+                    print(f"   [NanoOWL] Detected {label} (score: {score:.2f}) -> Zone {zone_id}")
+                    detections['zones'][zone_id] = {
+                        'score': float(score),
+                        'marker': label,
+                        'box': [int(v) for v in box]
+                    }
+        
         return detections
+
+    def detect_and_get_pose(self, rgb_image, depth_image, grasp_node):
+        """
+        NanoOWL로 블록 감지 후 ICP를 사용하여 world frame에서의 pose 계산.
+        Returns: (color, T_world_block) 또는 (None, None) if not found
+        """
+        img_rgb = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
+        img_pil = PILImage.fromarray(img_rgb)
+        
+        output = self.predictor.predict(
+            image=img_pil,
+            text=OBJECTS,
+            text_encodings=self.text_encodings,
+            threshold=THRESHOLD
+        )
+        
+        for i, score in enumerate(output.scores):
+            if score > GRASP_SCORE_THRESHOLD:
+                label = OBJECTS[output.labels[i]]
+                box = output.boxes[i]
+                
+                if "block" in label:
+                    color = self.COLOR_MAP.get(label, label)
+                    print(f"   [NanoOWL] Found {label} (score: {score:.2f})")
+                    
+                    # ICP pose estimation
+                    x0, y0, x1, y1 = [int(v) for v in box]
+                    
+                    # Add padding
+                    pad = 10
+                    h, w = depth_image.shape
+                    x0 = max(0, x0 - pad)
+                    y0 = max(0, y0 - pad)
+                    x1 = min(w, x1 + pad)
+                    y1 = min(h, y1 + pad)
+                    
+                    roi = (x0, y0, x1-x0, y1-y0)
+                    
+                    print("   Running ICP...")
+                    scene_pcd = self.icp_estimator.depth_to_pointcloud(depth_image, INTRINSICS, roi=roi)
+                    T_cam_block = self.icp_estimator.estimate_pose(scene_pcd, max_dist=0.02)
+                    
+                    t_cam = T_cam_block[:3, 3]
+                    print(f"   ICP Refined Pos (Cam Frame): {t_cam}")
+                    
+                    # Transform to World
+                    q_now = grasp_node.get_joint_positions()
+                    T_world_cam = forward_kinematics(q_now, "cam")
+                    T_world_block = T_world_cam @ T_cam_block
+                    
+                    print(f"   Target World Pose:\n{T_world_block}")
+                    
+                    return color, T_world_block
+        
+        return None, None
 
 
 # -------------------------------------------------------------
@@ -212,52 +443,103 @@ class YoloDetectorWrapper:
 # -------------------------------------------------------------
 class SmartMission:
     def __init__(self, nav_node, grasp_node):
-        self.nav = nav_node  # 네비게이션 컨트롤러를 받아서 씀
+        self.nav = nav_node
         self.grasp = grasp_node
         self.world_map = {
-            "loc_1": {"coords": (0.22586322614275445, -0.7200596135971158), "zone_id": None, "cube_color": None},
-            "loc_2": {"coords": (-0.9819009900093079, -1.2106988430023193), "zone_id": None, "cube_color": None},
-            "loc_3": {"coords": (-2.126121997833252, -1.3567204475402832), "zone_id": None, "cube_color": None}
+            "loc_1": {"coords": (1.824796199798584, -0.5843376517295837), "zone_id": None, "cube_color": None, "marker": None},
+            "loc_2": {"coords": (0.526938259601593, -1.097978115081787), "zone_id": None, "cube_color": None, "marker": None},
+            "loc_3": {"coords": (0.980643630027771, 1.1787939071655273), "zone_id": None, "cube_color": None, "marker": None}
         }
         self.task_queue = task_queue
         
-        # [Init YOLO Detector]
+        # Dynamic state for LLM planning
+        self.discovered_map = {}    # zone_id -> marker_name
+        self.discovered_blocks = {} # block_name -> zone_id
+        
+        # [Init NanoOWL Detector]
         try:
-            # Assuming best.pth is in yolo_detector/checkpoints/best.pth
-            ckpt_path = os.path.abspath(os.path.join(current_dir, '../yolo_detector/checkpoints/best.pth'))
-            self.detector = YoloDetectorWrapper(ckpt_path=ckpt_path)
-            print(">> YoloDetector initialized successfully.")
+            self.detector = NanoOwlDetector()
+            print(">> NanoOwlDetector initialized successfully.")
         except Exception as e:
-            print(f"!! Failed to initialize YoloDetector: {e}")
+            print(f"!! Failed to initialize NanoOwlDetector: {e}")
             self.detector = None
             
-        # Init Gemini
+        # Init LLM Planner (new improved version)
         try:
-            self.client = genai.Client(api_key=os.environ["API_KEY"])
-        except:
-            self.client = None
+            self.planner = LLMPlanner(api_key=os.environ["API_KEY"])
+        except Exception as e:
+            print(f"!! Failed to initialize LLMPlanner: {e}")
+            self.planner = None
 
     def run_smart_mission(self):
-        # [Step 1] 사용자 입력 및 LLM 계획 수립
-        user_prompt = input("Enter Task Prompt: ")
-        # 여기서 실제 LLM 모듈을 호출해야 함 (지금은 더미 함수 사용)
-    #    self.task_queue = self.generate_plan_from_llm(user_prompt)
+        # [Step 1] Get user instruction via Voice or Keyboard
+        print("\n" + "="*50)
+        print("🎤 VOICE INPUT MODE")
+        print("="*50)
         
-        # [Step 2] Phase 1: 똑똑한 탐색 (loc_3 생략 로직 포함)
+        # Try voice input first
+        user_prompt = get_voice_command(timeout=30)
+        
+        # Fallback to keyboard if no voice command
+        if not user_prompt:
+            user_prompt = input("Enter Task Prompt (keyboard): ")
+        
+        # [Step 2] Phase 1: Smart Exploration
         print("\n--- [Phase 1] Start Smart Exploration ---")
         search_order = ["loc_1", "loc_2", "loc_3"]
         
         for key in search_order:
-            self.visit_and_scan(key) # 이동 및 스캔 함수 분리 추천
+            self.visit_and_scan(key)
+        
+        # Build dynamic state from exploration
+        self._build_dynamic_state()
 
-        possible_colors = ["red", "blue", "green"]
-        active_colors = [c for c in possible_colors if c in user_prompt.lower()]
+        # [Step 3] Generate Plan with LLM using dynamic state
+        print("\n--- [Phase 2] Generate Plan with LLM ---")
+        if self.planner:
+            self.task_queue = self.planner.generate_plan(
+                user_prompt, 
+                self.discovered_map, 
+                self.discovered_blocks
+            )
+        else:
+            print("!! LLMPlanner not available, using default queue")
         
-        # [Step 3] 추론 (Inference)
-      #  self.perform_deduction(active_colors) # loc_3 정보 채우기
+        if not self.task_queue:
+            print("!! No valid plan generated. Using default task queue.")
+        else:
+            print(f">> Generated Plan: {json.dumps(self.task_queue, indent=2)}")
         
-        # [Step 4] Phase 2: 실행 (Map + Task 결합)
+        # [Step 4] Phase 3: Execution
+        print("\n--- [Phase 3] Execution ---")
         self.run_phase_2_execution()
+    
+    def _build_dynamic_state(self):
+        """Build discovered_map and discovered_blocks from world_map."""
+        # Zone marker name mapping
+        marker_names = {1: "bird", 2: "chair", 3: "horse"}
+        
+        for loc, info in self.world_map.items():
+            zone_id = info.get("zone_id")
+            cube_color = info.get("cube_color")
+            marker = info.get("marker")
+            
+            if zone_id:
+                zone_key = f"zone_{zone_id}"
+                # Use marker name if available, otherwise use default
+                if marker:
+                    self.discovered_map[zone_key] = marker
+                elif zone_id in marker_names:
+                    self.discovered_map[zone_key] = marker_names[zone_id]
+            
+            if cube_color and cube_color != "empty_spot":
+                block_key = f"{cube_color}_block"
+                if zone_id:
+                    self.discovered_blocks[block_key] = f"zone_{zone_id}"
+        
+        print(f"\n>> Built Dynamic State:")
+        print(f"   Map Config: {self.discovered_map}")
+        print(f"   Block State: {self.discovered_blocks}")
     
     def visit_and_scan(self, loc_key):
         """
@@ -271,6 +553,11 @@ class SmartMission:
         # 1. 이동 (Navigation)
         print(f"\n>> [Phase 1] Moving to {loc_key} at ({x}, {y})...")
         success = self.nav.move_to_coordinate(x, y)
+        try:
+            self.nav.move_forward(0.1)  # 10cm = 0.1m
+            time.sleep(1.0)
+        except Exception as e:
+            print(f"   !! Failed to move forward 10cm: {e}")
         if not success:
             print(f"!! Failed to move to {loc_key}. Skipping scan.")
             return
@@ -303,28 +590,32 @@ class SmartMission:
                 print("!! No image received from camera.")
                 continue
 
-            # 4. YOLO 감지
+            # 4. NanoOWL 감지
             if self.detector:
                 detections = self.detector.detect(img)
-                # detections: {'red': 0.95, 'blue': 0.88, 1: 0.99, ...}
+                # detections: {'blocks': {'red': {...}, ...}, 'zones': {1: {...}, ...}}
                 
-                if detections:
-                    print(f"   Found Objects: {list(detections.keys())}")
+                blocks = detections.get('blocks', {})
+                zones = detections.get('zones', {})
+                
+                if blocks or zones:
+                    print(f"   Found Blocks: {list(blocks.keys())}, Zones: {list(zones.keys())}")
                     
-                    for obj in detections.keys():
-                        # Identifiers: 'red', 'blue', 'green', 1, 2, 3
-                        
-                        if obj in ['red', 'blue', 'green']:
-                            loc_info["cube_color"] = obj
-                            print(f"   -> Found Block: {obj}")
-                            
-                        elif obj in [1, 2, 3]:
-                            loc_info["zone_id"] = obj
-                            print(f"   -> Found Zone ID: {obj}")
+                    # 블록 감지 결과 저장
+                    for color in blocks.keys():
+                        if color in ['orange', 'red', 'green', 'blue']:
+                            loc_info["cube_color"] = color
+                            print(f"   -> Found Block: {color}")
+                    
+                    # Zone 감지 결과 저장
+                    for zone_id in zones.keys():
+                        if zone_id in [1, 2, 3]:
+                            loc_info["zone_id"] = zone_id
+                            print(f"   -> Found Zone: {zone_id}")
                 else:
                     print("   No relevant objects found.")
             else:
-                print("!! YoloDetector is not initialized.")
+                print("!! NanoOwlDetector is not initialized.")
             
             # 체크: Zone ID를 찾았는가?
             if loc_info["zone_id"] is not None:
@@ -394,86 +685,109 @@ class SmartMission:
             return []
 
     def run_phase_2_execution(self):
+        """Execute the task queue with support for new action format."""
         print("\n--- [Phase 2] Execution Start ---")
         
-        # Color -> ID Mapping (STILL NEEDED FOR GRASPING - Assuming we use YOLO for Spotting but fixed IDs for Grasping?)
-        # Wait, GraspingNode likely uses pre-calibrated positions or AR tag IDs. 
-        # If we remove MarkerDetector, we might lose the 'ID' that GraspingNode needs if it relies on ID.
-        # But 'grasping.py' uses simple open loop or coordinates? Let's assume it relies on ID 5,6,7.
-        color_map = {"red": 5, "blue": 6, "green": 7}
-        # Color -> Place Action Mapping (assumed based on final.py/grasping.py)
-        # Assuming we place 'blue' cube using 'blue_3' action, etc.
-        place_map = {"red": "red_3", "blue": "blue_3", "green": "green_3"}
+        # Place action mapping for grasp.place()
+        place_action_map = {"red": "red_3", "blue": "blue_3", "green": "green_3"}
         
         # Track what we are holding
         holding_color = None
         
         for task in self.task_queue:
-            action = task["action"]
+            action = task.get("action", "")
+            target = task.get("target", "")
             
-            if action == "pick":
-                color = task["target_color"]
-                print(f"\n>> Task: PICK {color}")
+            # Handle legacy format (target_color, target_zone)
+            if "target_color" in task:
+                target = f"{task['target_color']}_block"
+            if "target_zone" in task:
+                target = f"zone_{task['target_zone']}"
+            
+            print(f"\n>> Executing: {action}({target})")
+            
+            # ============ NAVIGATE ============
+            if action == "navigate":
+                zone_num = self._extract_zone_number(target)
+                if zone_num:
+                    # Find location with this zone
+                    target_loc = self._find_location_by_zone(zone_num)
+                    if target_loc:
+                        coords = self.world_map[target_loc]["coords"]
+                        print(f"   -> Navigating to {target} at {coords}")
+                        self.nav.move_to_coordinate(*coords)
+                        try:
+                            self.nav.move_forward(0.1)
+                            time.sleep(1.0)
+                        except Exception as e:
+                            print(f"   !! Move forward failed: {e}")
+                    else:
+                        print(f"   !! Cannot find {target} in World Map!")
+                elif target == "start_point":
+                    print("   -> Returning to start point")
+                    self.nav.move_to_coordinate(0.0, 0.0)
+                else:
+                    print(f"   !! Unknown navigation target: {target}")
+            
+            # ============ PICK ============
+            elif action == "pick":
+                # Extract color from target (e.g., "red_block" -> "red")
+                color = target.replace("_block", "")
+                print(f"   -> Picking {color} block")
                 
-                # 1. Find location in map
-                target_loc = None
-                for loc, info in self.world_map.items():
-                    if info["cube_color"] == color:
-                        target_loc = loc
-                        break
+                # Find location of this color
+                target_loc = self._find_location_by_color(color)
                 
                 if target_loc:
                     coords = self.world_map[target_loc]["coords"]
-                    print(f"   -> Found {color} at {target_loc} {coords}. Moving...")
-                    self.nav.move_to_coordinate(*coords)
+                    print(f"   -> Found {color} at {target_loc} {coords}")
                     
-                    # Grasp
-                    mid = color_map.get(color)
-                    if mid:
-                        print(f"   -> Executing Grasp for ID {mid}...")
-                        success = self.grasp.grasp(mid)
-                        if success:
-                            print("      Grasp Success!")
-                            holding_color = color
+                    # ICP-based Grasp
+                    if self.detector and self.grasp:
+                        print(f"   -> Detecting {color} block with NanoOWL + ICP...")
+                        
+                        rclpy.spin_once(self.grasp, timeout_sec=0.5)
+                        rgb_img = self.grasp.image
+                        depth_img = self.grasp.depth_image
+                        
+                        if rgb_img is not None and depth_img is not None:
+                            detected_color, T_world_block = self.detector.detect_and_get_pose(
+                                rgb_img, depth_img, self.grasp
+                            )
+                            
+                            if T_world_block is not None:
+                                print(f"   -> Executing ICP-based Grasp...")
+                                success = self.grasp.grasp_pose(T_world_block)
+                                if success:
+                                    print("      Grasp Success!")
+                                    holding_color = color
+                                else:
+                                    print("      Grasp Failed!")
+                            else:
+                                print(f"   !! Could not detect {color} block with ICP")
                         else:
-                            print("      Grasp Failed!")
+                            print("   !! No camera image available for ICP")
                     else:
-                        print(f"   !! Unknown Color ID for {color}")
+                        print("   !! Detector or Grasp node not available")
                 else:
-                    print(f"   !! Error: Cannot find {color} in World Map!")
-
+                    print(f"   !! Cannot find {color} in World Map!")
+            
+            # ============ PLACE ============
             elif action == "place":
-                zone = task["target_zone"]
-                print(f"\n>> Task: PLACE at Zone {zone}")
+                zone_num = self._extract_zone_number(target)
+                print(f"   -> Placing at zone {zone_num}")
                 
                 if not holding_color:
                     print("   !! Error: Not holding anything to place!")
                     continue
                 
-                # 1. Find location of Zone
-                target_loc = None
-                for loc, info in self.world_map.items():
-                    if info["zone_id"] == zone:
-                        target_loc = loc
-                        break
-                        
+                target_loc = self._find_location_by_zone(zone_num)
+                
                 if target_loc:
                     coords = self.world_map[target_loc]["coords"]
-                    print(f"   -> Found Zone {zone} at {target_loc} {coords}. Moving...")
-                    self.nav.move_to_coordinate(*coords)
-                    # Move forward ~10cm using joint control (bypass Nav2)
-                    try:
-                        current_q = self.grasp.get_joint_positions()
-                        target_q = current_q.copy()
-                        # Adjust joint 2 (index 1) forward; value may need tuning
-                        target_q[1] += 0.1
-                        self.grasp.set_joint_positions(target_q, 1.0)
-                        time.sleep(1.0)
-                    except Exception as e:
-                        print(f"   !! Failed to move forward 10cm: {e}")
-
-                    # Place
-                    action_name = place_map.get(holding_color)
+                    print(f"   -> Found zone {zone_num} at {target_loc} {coords}")
+                    
+                    action_name = place_action_map.get(holding_color)
                     if action_name:
                         print(f"   -> Executing Place Action '{action_name}'...")
                         success = self.grasp.place(action_name)
@@ -483,9 +797,49 @@ class SmartMission:
                         else:
                             print("      Place Failed!")
                     else:
-                        print(f"   !! No defined place action for holding color {holding_color}")
+                        print(f"   !! No place action for color {holding_color}")
                 else:
-                    print(f"   !! Error: Cannot find Zone {zone} in World Map!")
+                    print(f"   !! Cannot find zone {zone_num} in World Map!")
+            
+            # ============ SAY ============
+            elif action == "say":
+                text = target or task.get("text", "")
+                print(f"   Robot says: '{text}'")
+            
+            else:
+                print(f"   !! Unknown action: {action}")
+        
+        print("\n--- Execution Complete ---")
+    
+    def _extract_zone_number(self, target):
+        """Extract zone number from string like 'zone_1' or '1'."""
+        if isinstance(target, int):
+            return target
+        if isinstance(target, str):
+            if target.startswith("zone_"):
+                try:
+                    return int(target.split("_")[1])
+                except:
+                    pass
+            try:
+                return int(target)
+            except:
+                pass
+        return None
+    
+    def _find_location_by_zone(self, zone_num):
+        """Find location key by zone number."""
+        for loc, info in self.world_map.items():
+            if info.get("zone_id") == zone_num:
+                return loc
+        return None
+    
+    def _find_location_by_color(self, color):
+        """Find location key by cube color."""
+        for loc, info in self.world_map.items():
+            if info.get("cube_color") == color:
+                return loc
+        return None
             
     def perform_deduction(self, active_colors):
         print(">> Performing Deduction...")

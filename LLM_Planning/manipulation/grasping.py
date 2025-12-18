@@ -107,7 +107,7 @@ class GraspingNode(GraspingNodeBase):
         is_success = False
 
         # (옵션) 시작할 때 실제 로봇도 q_init으로 맞춰두고 싶으면 이거 켜기
-    #    self.align_to_init()
+        self.align_to_init()
 
         # 0) 그리퍼 열기
         self.gripper_open(1.0)

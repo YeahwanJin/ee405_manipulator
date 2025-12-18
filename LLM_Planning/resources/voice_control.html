@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 Robot Voice Control</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #fff;
+        }
+
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2rem;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #aaa;
+            margin-bottom: 30px;
+        }
+
+        .mic-button {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: none;
+            background: linear-gradient(145deg, #e94560, #d63251);
+            cursor: pointer;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 20px auto;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 20px rgba(233, 69, 96, 0.4);
+        }
+
+        .mic-button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 6px 25px rgba(233, 69, 96, 0.6);
+        }
+
+        .mic-button.listening {
+            animation: pulse 1.5s infinite;
+            background: linear-gradient(145deg, #4ade80, #22c55e);
+            box-shadow: 0 4px 20px rgba(74, 222, 128, 0.4);
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                transform: scale(1);
+            }
+
+            50% {
+                transform: scale(1.1);
+            }
+        }
+
+        .mic-icon {
+            font-size: 3rem;
+        }
+
+        .status {
+            text-align: center;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            font-weight: 500;
+            min-height: 50px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .status.idle {
+            background: rgba(255, 255, 255, 0.1);
+            color: #aaa;
+        }
+
+        .status.listening {
+            background: rgba(74, 222, 128, 0.2);
+            color: #4ade80;
+        }
+
+        .status.success {
+            background: rgba(59, 130, 246, 0.2);
+            color: #60a5fa;
+        }
+
+        .status.error {
+            background: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+        }
+
+        .transcript-box {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            min-height: 80px;
+        }
+
+        .transcript-label {
+            font-size: 0.8rem;
+            color: #888;
+            margin-bottom: 10px;
+        }
+
+        .transcript-text {
+            font-size: 1.2rem;
+            line-height: 1.5;
+            color: #fff;
+        }
+
+        .send-button {
+            width: 100%;
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(145deg, #3b82f6, #2563eb);
+            color: #fff;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .send-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(59, 130, 246, 0.4);
+        }
+
+        .send-button:disabled {
+            background: #444;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .history {
+            margin-top: 30px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .history-label {
+            font-size: 0.9rem;
+            color: #888;
+            margin-bottom: 10px;
+        }
+
+        .history-item {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 10px 15px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .history-item .time {
+            color: #666;
+            font-size: 0.8rem;
+        }
+
+        .not-supported {
+            text-align: center;
+            color: #f87171;
+            padding: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>🤖 Robot Voice Control</h1>
+        <p class="subtitle">Speak commands to control your robot</p>
+
+        <div id="main-content">
+            <button class="mic-button" id="micBtn" onclick="toggleListening()">
+                <span class="mic-icon">🎤</span>
+            </button>
+
+            <div class="status idle" id="status">
+                Click the microphone to start
+            </div>
+
+            <div class="transcript-box">
+                <div class="transcript-label">📝 Transcription</div>
+                <div class="transcript-text" id="transcript">
+                    Your speech will appear here...
+                </div>
+            </div>
+
+            <button class="send-button" id="sendBtn" onclick="sendCommand()" disabled>
+                📤 Send to Robot
+            </button>
+
+            <div class="history" id="history">
+                <div class="history-label">📜 Command History</div>
+            </div>
+        </div>
+
+        <div id="not-supported" class="not-supported" style="display: none;">
+            <p style="margin-bottom: 15px;"></p>⚠️ Voice input requires HTTPS or localhost</p>
+            <p style="color: #aaa; font-size: 0.9rem; margin-bottom: 20px;">Type your command instead:</p>
+
+            <input type="text" id="textInput" placeholder="e.g. Place red cube in zone 3"
+                style="width: 100%; padding: 15px; border-radius: 10px; border: 1px solid #444; 
+                background: rgba(0,0,0,0.3); color: white; font-size: 1rem; margin-bottom: 15px; box-sizing: border-box;">
+
+            <button id="textSendBtn" style="width: 100%; padding: 15px; border: none; border-radius: 10px; 
+                background: linear-gradient(145deg, #3b82f6, #2563eb); color: white; 
+                font-size: 1.1rem; font-weight: 600; cursor: pointer;">
+                📤 Send Command
+            </button>
+
+            <div id="textStatus"
+                style="margin-top: 15px; padding: 10px; border-radius: 8px; text-align: center; min-height: 20px;">
+            </div>
+
+            <div style="margin-top: 20px;">
+                <div style="font-size: 0.9rem; color: #888; margin-bottom: 10px;">📜 Command History</div>
+                <div id="textHistory"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Text input functionality (works without Speech API)
+        document.addEventListener('DOMContentLoaded', function () {
+            const textInput = document.getElementById('textInput');
+            const textSendBtn = document.getElementById('textSendBtn');
+            const textStatus = document.getElementById('textStatus');
+            const textHistory = document.getElementById('textHistory');
+
+            if (textSendBtn) {
+                textSendBtn.addEventListener('click', sendTextCmd);
+            }
+            if (textInput) {
+                textInput.addEventListener('keypress', function (e) {
+                    if (e.key === 'Enter') sendTextCmd();
+                });
+            }
+
+            async function sendTextCmd() {
+                const text = textInput.value.trim();
+                if (!text) {
+                    textStatus.style.color = '#f87171';
+                    textStatus.textContent = 'Please enter a command';
+                    return;
+                }
+
+                textStatus.style.color = '#60a5fa';
+                textStatus.textContent = '📤 Sending...';
+                textSendBtn.disabled = true;
+
+                try {
+                    const response = await fetch('/voice_command', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: text })
+                    });
+                    const data = await response.json();
+
+                    if (data.status === 'ok') {
+                        textStatus.style.color = '#4ade80';
+                        textStatus.textContent = '✅ Sent!';
+
+                        // Add to history
+                        const item = document.createElement('div');
+                        item.style.cssText = 'background: rgba(255,255,255,0.05); padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; font-size: 0.9rem;';
+                        item.textContent = text;
+                        textHistory.insertBefore(item, textHistory.firstChild);
+
+                        textInput.value = '';
+                    } else {
+                        throw new Error(data.message);
+                    }
+                } catch (err) {
+                    textStatus.style.color = '#f87171';
+                    textStatus.textContent = '❌ ' + err.message;
+                }
+                textSendBtn.disabled = false;
+            }
+        });
+    </script>
+
+    <script>
+        // Check browser support
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+        if (!SpeechRecognition) {
+            document.getElementById('main-content').style.display = 'none';
+            document.getElementById('not-supported').style.display = 'block';
+        }
+
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+
+        let isListening = false;
+        let finalTranscript = '';
+
+        const micBtn = document.getElementById('micBtn');
+        const statusEl = document.getElementById('status');
+        const transcriptEl = document.getElementById('transcript');
+        const sendBtn = document.getElementById('sendBtn');
+        const historyEl = document.getElementById('history');
+
+        function toggleListening() {
+            if (isListening) {
+                recognition.stop();
+            } else {
+                finalTranscript = '';
+                transcriptEl.textContent = 'Listening...';
+                recognition.start();
+            }
+        }
+
+        recognition.onstart = () => {
+            isListening = true;
+            micBtn.classList.add('listening');
+            micBtn.querySelector('.mic-icon').textContent = '🔴';
+            statusEl.className = 'status listening';
+            statusEl.textContent = '🎤 Listening... Speak now!';
+            sendBtn.disabled = true;
+        };
+
+        recognition.onend = () => {
+            isListening = false;
+            micBtn.classList.remove('listening');
+            micBtn.querySelector('.mic-icon').textContent = '🎤';
+
+            if (finalTranscript) {
+                statusEl.className = 'status success';
+                statusEl.textContent = '✅ Ready to send!';
+                sendBtn.disabled = false;
+            } else {
+                statusEl.className = 'status idle';
+                statusEl.textContent = 'Click the microphone to start';
+            }
+        };
+
+        recognition.onresult = (event) => {
+            let interimTranscript = '';
+
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const transcript = event.results[i][0].transcript;
+                if (event.results[i].isFinal) {
+                    finalTranscript += transcript;
+                } else {
+                    interimTranscript += transcript;
+                }
+            }
+
+            transcriptEl.textContent = finalTranscript || interimTranscript || 'Listening...';
+        };
+
+        recognition.onerror = (event) => {
+            console.error('Speech recognition error:', event.error);
+            statusEl.className = 'status error';
+            statusEl.textContent = `❌ Error: ${event.error}`;
+            isListening = false;
+            micBtn.classList.remove('listening');
+            micBtn.querySelector('.mic-icon').textContent = '🎤';
+        };
+
+        async function sendCommand() {
+            if (!finalTranscript) return;
+
+            sendBtn.disabled = true;
+            statusEl.className = 'status listening';
+            statusEl.textContent = '📤 Sending...';
+
+            try {
+                const response = await fetch('/voice_command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: finalTranscript })
+                });
+
+                const data = await response.json();
+
+                if (data.status === 'ok') {
+                    statusEl.className = 'status success';
+                    statusEl.textContent = '✅ Command sent successfully!';
+                    addToHistory(finalTranscript);
+                    finalTranscript = '';
+                    transcriptEl.textContent = 'Your speech will appear here...';
+                } else {
+                    throw new Error(data.message || 'Unknown error');
+                }
+            } catch (error) {
+                statusEl.className = 'status error';
+                statusEl.textContent = `❌ Failed: ${error.message}`;
+            }
+
+            setTimeout(() => {
+                statusEl.className = 'status idle';
+                statusEl.textContent = 'Click the microphone to start';
+            }, 3000);
+        }
+
+        function addToHistory(text) {
+            const time = new Date().toLocaleTimeString();
+            const item = document.createElement('div');
+            item.className = 'history-item';
+            item.innerHTML = `<span class="time">${time}</span> ${text}`;
+
+            // Insert after the label
+            const label = historyEl.querySelector('.history-label');
+            label.after(item);
+        }
+
+        // Text input fallback for unsupported browsers
+        async function sendTextCommand() {
+            const textInput = document.getElementById('textInput');
+            const textStatus = document.getElementById('textStatus');
+            const text = textInput.value.trim();
+
+            if (!text) {
+                textStatus.style.background = 'rgba(239, 68, 68, 0.2)';
+                textStatus.style.color = '#f87171';
+                textStatus.textContent = '❌ Please enter a command';
+                return;
+            }
+
+            textStatus.style.background = 'rgba(59, 130, 246, 0.2)';
+            textStatus.style.color = '#60a5fa';
+            textStatus.textContent = '📤 Sending...';
+
+            try {
+                const response = await fetch('/voice_command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text })
+                });
+
+                const data = await response.json();
+
+                if (data.status === 'ok') {
+                    textStatus.style.background = 'rgba(74, 222, 128, 0.2)';
+                    textStatus.style.color = '#4ade80';
+                    textStatus.textContent = '✅ Command sent!';
+
+                    // Add to history
+                    const time = new Date().toLocaleTimeString();
+                    const item = document.createElement('div');
+                    item.className = 'history-item';
+                    item.innerHTML = `<span class="time">${time}</span> ${text}`;
+                    const label = document.getElementById('textHistory').querySelector('.history-label');
+                    label.after(item);
+
+                    textInput.value = '';
+                } else {
+                    throw new Error(data.message || 'Unknown error');
+                }
+            } catch (error) {
+                textStatus.style.background = 'rgba(239, 68, 68, 0.2)';
+                textStatus.style.color = '#f87171';
+                textStatus.textContent = `❌ Failed: ${error.message}`;
+            }
+        }
+
+        // Allow Enter key to submit text
+        document.addEventListener('DOMContentLoaded', function () {
+            const textInput = document.getElementById('textInput');
+            if (textInput) {
+                textInput.addEventListener('keypress', function (e) {
+                    if (e.key === 'Enter') {
+                        sendTextCommand();
+                    }
+                });
+            }
+        });
+    </script>
+</body>
+
+</html>
