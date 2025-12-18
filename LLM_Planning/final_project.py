@@ -337,9 +337,10 @@ class NanoOwlDetector:
         }
         print(">> NanoOwlDetector initialized successfully.")
 
-    def detect(self, image):
+    def detect(self, image, save_debug=True):
         """
         NanoOWL을 사용하여 블록과 Zone 감지. 색상/Zone ID와 신뢰도 반환.
+        save_debug: True면 감지 결과를 이미지로 저장
         """
         img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         img_pil = PILImage.fromarray(img_rgb)
@@ -356,10 +357,14 @@ class NanoOwlDetector:
             'zones': {}    # Zone 감지 결과
         }
         
+        # Debug: 이미지에 감지 결과 그리기
+        debug_img = image.copy()
+        
         for i, score in enumerate(output.scores):
             if score > GRASP_SCORE_THRESHOLD:
                 label = OBJECTS[output.labels[i]]
                 box = output.boxes[i]
+                x0, y0, x1, y1 = [int(v) for v in box]
                 
                 # 블록 감지
                 if "block" in label:
@@ -367,8 +372,12 @@ class NanoOwlDetector:
                     print(f"   [NanoOWL] Detected {label} (score: {score:.2f}) -> {color}")
                     detections['blocks'][color] = {
                         'score': float(score),
-                        'box': [int(v) for v in box]
+                        'box': [x0, y0, x1, y1]
                     }
+                    # Debug: 초록색 박스
+                    cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                    cv2.putText(debug_img, f"{color}: {score:.2f}", (x0, y0-10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
                 # Zone 마커 감지 (bird, chair, horse)
                 elif label in self.ZONE_MAP:
@@ -377,8 +386,31 @@ class NanoOwlDetector:
                     detections['zones'][zone_id] = {
                         'score': float(score),
                         'marker': label,
-                        'box': [int(v) for v in box]
+                        'box': [x0, y0, x1, y1]
                     }
+                    # Debug: 파란색 박스
+                    cv2.rectangle(debug_img, (x0, y0), (x1, y1), (255, 0, 0), 2)
+                    cv2.putText(debug_img, f"Z{zone_id}({label}): {score:.2f}", (x0, y0-10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        
+        # Debug: 이미지 저장
+        if save_debug:
+            import os
+            from datetime import datetime
+            debug_dir = "/home/ubuntu/ros2_ws/src/LLM_Planning/debug_images"
+            os.makedirs(debug_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # 원본 이미지 저장
+            raw_path = f"{debug_dir}/raw_{timestamp}.jpg"
+            cv2.imwrite(raw_path, image)
+            
+            # 감지 결과 이미지 저장
+            det_path = f"{debug_dir}/det_{timestamp}.jpg"
+            cv2.imwrite(det_path, debug_img)
+            
+            print(f"   [DEBUG] Saved: {raw_path}")
+            print(f"   [DEBUG] Saved: {det_path}")
         
         return detections
 
@@ -445,6 +477,7 @@ class SmartMission:
     def __init__(self, nav_node, grasp_node):
         self.nav = nav_node
         self.grasp = grasp_node
+        print(f">> SmartMission init: grasp_node={grasp_node}, type={type(grasp_node)}")
         import math
         # Default values used when detection fails
         self.world_map = {
@@ -588,38 +621,71 @@ class SmartMission:
         except Exception as e:
             print(f"   !! Failed to move forward 10cm: {e}")
             
-        # ============ STAGE 1: Scan for BLOCKS in init position ============
+        # ============ STAGE 1: Scan for BLOCKS with multi-tilt retry ============
+        # 시도 순서: 초기 위치 -> tilt 1 -> tilt 2 -> tilt 3 -> 초기 위치로 복귀
+        detected_block = None
+        
         if self.grasp:
-            print("   [Stage 1] Aligning arm to init pose for BLOCK detection...")
+            print("   [Stage 1] Starting multi-tilt BLOCK detection...")
             rclpy.spin_once(self.grasp, timeout_sec=0.1)
             self.grasp.align_to_init(1.5)
-            time.sleep(2.0)
-        
-        print(f">> [Stage 1] Scanning for BLOCKS at {loc_key}...")
-        time.sleep(3.0)  # Camera stabilization
-        
-        # Use GraspingNode's image (same as working test code)
-        # Spin to get latest image
-        if self.grasp:
-            for _ in range(10):  # Spin multiple times to ensure fresh image
+            time.sleep(1.5)
+            
+            # 초기 위치 저장
+            q_init_saved = self.grasp.get_joint_positions().copy()
+            
+            # Tilt 설정: [(joint2_delta, joint3_delta), ...]
+            tilt_configs = [
+                (0.0, 0.0),    # 시도 1: 초기 위치
+                (0.2, -0.15),  # 시도 2: 약간 위로
+                (0.4, -0.25),  # 시도 3: 더 위로
+            ]
+            
+            for attempt, (j2_delta, j3_delta) in enumerate(tilt_configs):
+                print(f"\n   [Stage 1] Block detection attempt {attempt+1}/3 (j2+={j2_delta}, j3+={j3_delta})...")
+                
+                try:
+                    q_tilted = q_init_saved.copy()
+                    q_tilted[1] += j2_delta  # Joint 2
+                    q_tilted[2] += j3_delta  # Joint 3
+                    self.grasp.set_joint_positions(q_tilted, 1.0)
+                    for _ in range(12):  # Wait 1.2s with spin
+                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                except Exception as e:
+                    print(f"   !! Tilt failed: {e}")
+                    continue
+                
+                time.sleep(1.0)  # Camera stabilization
+                
+                # Get fresh image
+                for _ in range(10):
+                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                img = self.grasp.image
+                
+                if img is not None and self.detector:
+                    print(f"   [Stage 1] Got image: {img.shape}")
+                    detections = self.detector.detect(img.copy())
+                    blocks = detections.get('blocks', {})
+                    
+                    if blocks:
+                        print(f"   [Stage 1] Found Blocks: {list(blocks.keys())}")
+                        for color in blocks.keys():
+                            if color in ['orange', 'red', 'green', 'blue']:
+                                detected_block = color
+                                loc_info["cube_color"] = color
+                                print(f"   -> Found Block: {color}")
+                        break  # 감지 성공, 루프 종료
+                    else:
+                        print("   [Stage 1] No blocks detected at this angle.")
+            
+            # 초기 위치로 복귀
+            print("   [Stage 1] Returning to init position...")
+            self.grasp.set_joint_positions(q_init_saved, 1.0)
+            for _ in range(12):
                 rclpy.spin_once(self.grasp, timeout_sec=0.1)
-            img = self.grasp.image
-        else:
-            img = self.nav.get_image()
-            
-        if img is not None and self.detector:
-            print(f"   [Stage 1] Got image: {img.shape}")
-            detections = self.detector.detect(img)
-            blocks = detections.get('blocks', {})
-            
-            if blocks:
-                print(f"   [Stage 1] Found Blocks: {list(blocks.keys())}")
-                for color in blocks.keys():
-                    if color in ['orange', 'red', 'green', 'blue']:
-                        loc_info["cube_color"] = color
-                        print(f"   -> Found Block: {color}")
-            else:
-                print("   [Stage 1] No blocks detected.")
+        
+        if detected_block is None:
+            print("   [Stage 1] Block detection FAILED after all attempts.")
         
         # ============ STAGE 2: Tilt UP to scan for ZONE PICTURES ============
         print(f"\n>> [Stage 2] Tilting camera UP for ZONE PICTURE detection...")
@@ -672,7 +738,8 @@ class SmartMission:
 
             print(f"   [Stage 2] Got image: {img.shape}")
             if self.detector:
-                detections = self.detector.detect(img)
+                # Copy image to make it writable (fixes PyTorch tensor warning)
+                detections = self.detector.detect(img.copy())
                 zones = detections.get('zones', {})
                 
                 if zones:
@@ -812,7 +879,7 @@ class SmartMission:
                         print(f"   -> Navigating to {target} at {coords}")
                         self.nav.move_to_coordinate(coords[0], coords[1], yaw=yaw)
                         try:
-                            self.nav.move_forward(0.1)
+                            self.nav.move_forward(0.4)
                             time.sleep(1.0)
                         except Exception as e:
                             print(f"   !! Move forward failed: {e}")
@@ -837,31 +904,79 @@ class SmartMission:
                     coords = self.world_map[target_loc]["coords"]
                     print(f"   -> Found {color} at {target_loc} {coords}")
                     
-                    # ICP-based Grasp
+                    # ICP-based Grasp with multi-tilt retry
                     if self.detector and self.grasp:
-                        print(f"   -> Detecting {color} block with NanoOWL + ICP...")
+                        # [Phase 2] 블록 감지: 초기 위치에서 시작, 3번 tilt 시도 후 복귀
+                        print(f"   -> Starting multi-tilt block detection for {color}...")
+                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                        self.grasp.align_to_init(1.5)
+                        time.sleep(1.5)
                         
-                        rclpy.spin_once(self.grasp, timeout_sec=0.5)
-                        rgb_img = self.grasp.image
-                        depth_img = self.grasp.depth_image
+                        # 초기 위치 저장
+                        q_init_saved = self.grasp.get_joint_positions().copy()
                         
-                        if rgb_img is not None and depth_img is not None:
-                            detected_color, T_world_block = self.detector.detect_and_get_pose(
-                                rgb_img, depth_img, self.grasp
-                            )
+                        # Tilt 설정: [(joint2_delta, joint3_delta), ...]
+                        tilt_configs = [
+                            (0.0, 0.0),    # 시도 1: 초기 위치
+                            (0.2, -0.15),  # 시도 2: 약간 위로
+                            (0.4, -0.25),  # 시도 3: 더 위로
+                        ]
+                        
+                        T_world_block = None
+                        
+                        for attempt, (j2_delta, j3_delta) in enumerate(tilt_configs):
+                            print(f"\n   [Pick] Block detection attempt {attempt+1}/3 (j2+={j2_delta}, j3+={j3_delta})...")
                             
-                            if T_world_block is not None:
-                                print(f"   -> Executing ICP-based Grasp...")
-                                success = self.grasp.grasp_pose(T_world_block)
-                                if success:
-                                    print("      Grasp Success!")
-                                    holding_color = color
+                            try:
+                                q_tilted = q_init_saved.copy()
+                                q_tilted[1] += j2_delta  # Joint 2
+                                q_tilted[2] += j3_delta  # Joint 3
+                                self.grasp.set_joint_positions(q_tilted, 1.0)
+                                for _ in range(12):  # Wait 1.2s with spin
+                                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                            except Exception as e:
+                                print(f"   !! Tilt failed: {e}")
+                                continue
+                            
+                            time.sleep(1.0)  # Camera stabilization
+                            
+                            # Get fresh images
+                            for _ in range(10):
+                                rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                            
+                            rgb_img = self.grasp.image.copy() if self.grasp.image is not None else None
+                            depth_img = self.grasp.depth_image.copy() if self.grasp.depth_image is not None else None
+                            
+                            if rgb_img is not None and depth_img is not None:
+                                detected_color, T_world_block = self.detector.detect_and_get_pose(
+                                    rgb_img, depth_img, self.grasp
+                                )
+                                
+                                if T_world_block is not None:
+                                    print(f"   -> Block detected at attempt {attempt+1}!")
+                                    break  # 감지 성공
                                 else:
-                                    print("      Grasp Failed!")
+                                    print(f"   [Pick] No block detected at this angle.")
                             else:
-                                print(f"   !! Could not detect {color} block with ICP")
+                                print("   !! No camera image available")
+                        
+                        # 초기 위치로 복귀
+                        print("   [Pick] Returning to init position...")
+                        self.grasp.set_joint_positions(q_init_saved, 1.0)
+                        for _ in range(12):
+                            rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                        
+                        # Grasp 실행
+                        if T_world_block is not None:
+                            print(f"   -> Executing ICP-based Grasp...")
+                            success = self.grasp.grasp_pose(T_world_block)
+                            if success:
+                                print("      Grasp Success!")
+                                holding_color = color
+                            else:
+                                print("      Grasp Failed!")
                         else:
-                            print("   !! No camera image available for ICP")
+                            print(f"   !! Could not detect {color} block after all attempts")
                     else:
                         print("   !! Detector or Grasp node not available")
                 else:
@@ -1013,16 +1128,16 @@ def main(args=None):
     nav_controller = NavigationController()
     
     # 2. Grasping 노드 생성
-    # Import GraspingNode dynamically
+    # Import GraspingNode from LOCAL manipulation module (same directory as this file)
+    grasp_controller = None
     try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        manip_path = os.path.abspath(os.path.join(current_dir, '../manipulation_experiment_team9'))
-        if manip_path not in sys.path:
-            sys.path.append(manip_path)
         from manipulation.grasping import GraspingNode
         grasp_controller = GraspingNode("grasping_node")
+        print(f">> GraspingNode initialized successfully: {grasp_controller}")
     except Exception as e:
-        print(f"!! Failed to import GraspingNode: {e}")
+        import traceback
+        print(f"!! Failed to import/create GraspingNode: {e}")
+        traceback.print_exc()
         grasp_controller = None
 
     # 3. 미션 수행 객체 생성 (네비게이션 노드, 그랩 노드 전달)

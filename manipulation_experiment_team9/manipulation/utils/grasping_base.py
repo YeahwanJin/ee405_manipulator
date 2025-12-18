@@ -18,8 +18,10 @@ from .action_group_controller import ActionGroupController
 
 class GraspingNodeBase(Node):
     def __init__(self, name):
-        # Initialize ROS2 node
-        rclpy.init()
+        # Note: rclpy.init() should be called externally (e.g., in main())
+        # Only initialize if not already done
+        if not rclpy.ok():
+            rclpy.init()
         super().__init__(name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
 
         # Servo control
@@ -34,16 +36,21 @@ class GraspingNodeBase(Node):
         self.controller = ActionGroupController(
             self.joints_pub, '/home/ubuntu/software/arm_pc/ActionGroups')
 
-        # For Marker detection 
+        # For Marker detection + Depth image
         self.image_sub = self.create_subscription(Image, '/depth_cam/rgb/image_raw', self.image_callback, 1)
+        self.depth_sub = self.create_subscription(Image, '/depth_cam/depth/image_raw', self.depth_callback, 1)
         self.bridge = CvBridge()
         self.image = None
+        self.depth_image = None
         
         self.marker_detector = MarkerDetector()
         self.marker_ids = {"red" : 1, "blue" : 6, "green" : 7}
     
     def image_callback(self, msg):
         self.image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+    def depth_callback(self, msg):
+        self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
     def get_joint_positions_pulse(self):
         try:

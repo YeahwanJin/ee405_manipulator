@@ -15,8 +15,8 @@ class GraspingNode(GraspingNodeBase):
         self.running = True
         
         # [j1, j2, j3, j4, j5]
-        self.q_init = np.array([0.0, -1.1, 1.7, 1.7, 0.0], dtype=float)
-    #    self.q_init = np.array([0.0, -1.2, 1.5, 1.5, 0.0], dtype=float)
+        # Using same values as manipulation_experiment_team9
+        self.q_init = np.array([0.0, -1.2, 1.7, 1.3, 0.0], dtype=float)
 
         # 필요하면 “내가 마지막에 보낸 값”만 추적하고 쓸 수도 있음
         self.last_q = None
