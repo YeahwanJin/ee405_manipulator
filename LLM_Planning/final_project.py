@@ -125,10 +125,10 @@ class LLMPlanner:
     def __init__(self, api_key):
         genai_sdk.configure(api_key=api_key)
         self.model = genai_sdk.GenerativeModel(
-            'gemini-1.5-flash',
+            'gemini-2.5-flash',
             system_instruction=LLM_SYSTEM_PROMPT
         )
-        print(">> LLMPlanner initialized with gemini-1.5-flash")
+        print(">> LLMPlanner initialized with gemini-2.5-flash")
     
     def generate_plan(self, instruction, map_config, block_state):
         """
@@ -445,10 +445,30 @@ class SmartMission:
     def __init__(self, nav_node, grasp_node):
         self.nav = nav_node
         self.grasp = grasp_node
+        import math
+        # Default values used when detection fails
         self.world_map = {
-            "loc_1": {"coords": (1.824796199798584, -0.5843376517295837), "zone_id": None, "cube_color": None, "marker": None},
-            "loc_2": {"coords": (0.526938259601593, -1.097978115081787), "zone_id": None, "cube_color": None, "marker": None},
-            "loc_3": {"coords": (0.980643630027771, 1.1787939071655273), "zone_id": None, "cube_color": None, "marker": None}
+            # Zone 1: Face -90° (right) - Default: zone_1, blue block
+            "loc_1": {
+                "coords": (1.824796199798584, -0.5843376517295837), 
+                "yaw": -math.pi/2, 
+                "zone_id": None, "cube_color": None, "marker": None,
+                "default_zone_id": 1, "default_cube_color": "blue", "default_marker": "bird"
+            },
+            # Zone 2: Face 180° (backward) - Default: zone_2, green block
+            "loc_2": {
+                "coords": (0.526938259601593, -1.097978115081787), 
+                "yaw": math.pi, 
+                "zone_id": None, "cube_color": None, "marker": None,
+                "default_zone_id": 2, "default_cube_color": "green", "default_marker": "chair"
+            },
+            # Zone 3: Face 180° (backward) - Default: zone_3, empty (red block not here)
+            "loc_3": {
+                "coords": (0.980643630027771, 1.1787939071655273), 
+                "yaw": math.pi, 
+                "zone_id": None, "cube_color": None, "marker": None,
+                "default_zone_id": 3, "default_cube_color": "empty_spot", "default_marker": "horse"
+            }
         }
         self.task_queue = task_queue
         
@@ -543,112 +563,185 @@ class SmartMission:
     
     def visit_and_scan(self, loc_key):
         """
-        특정 위치(loc_key)로 이동한 뒤, 이미지를 캡처하고 마커를 분석하여
-        world_map 정보를 업데이트하는 함수.
-        Zone ID 미발견 시 카메라 각도를 조정(Tilt Up)하며 재시도.
+        Two-stage scanning approach:
+        1. Navigate to location
+        2. Scan for BLOCKS in init position (good for cube detection)
+        3. Tilt camera UP to scan for ZONE PICTURES (bird/chair/horse)
+        4. Return to init position before navigating to next location
         """
         loc_info = self.world_map[loc_key]
         x, y = loc_info["coords"]
+        yaw = loc_info.get("yaw")  # Get fixed orientation for this zone
         
         # 1. 이동 (Navigation)
         print(f"\n>> [Phase 1] Moving to {loc_key} at ({x}, {y})...")
-        success = self.nav.move_to_coordinate(x, y)
-        try:
-            self.nav.move_forward(0.1)  # 10cm = 0.1m
-            time.sleep(1.0)
-        except Exception as e:
-            print(f"   !! Failed to move forward 10cm: {e}")
+        success = self.nav.move_to_coordinate(x, y, yaw=yaw)
         if not success:
             print(f"!! Failed to move to {loc_key}. Skipping scan.")
             return
+        
+        # MPPI로 도착 후 cmd_vel로 10cm 추가 전진
+        print(f"   >> Moving forward 10cm closer to block...")
+        try:
+            self.nav.move_forward(0.3)  # 10cm = 0.1m
+            time.sleep(1.0)
+        except Exception as e:
+            print(f"   !! Failed to move forward 10cm: {e}")
             
-        # Arm Init Position (Ensure consistent start)
+        # ============ STAGE 1: Scan for BLOCKS in init position ============
         if self.grasp:
-            print("   Aligning arm to init pose...")
+            print("   [Stage 1] Aligning arm to init pose for BLOCK detection...")
+            rclpy.spin_once(self.grasp, timeout_sec=0.1)
             self.grasp.align_to_init(1.5)
-            # Raise arm to get a better view before scanning
+            time.sleep(2.0)
+        
+        print(f">> [Stage 1] Scanning for BLOCKS at {loc_key}...")
+        time.sleep(3.0)  # Camera stabilization
+        
+        # Use GraspingNode's image (same as working test code)
+        # Spin to get latest image
+        if self.grasp:
+            for _ in range(10):  # Spin multiple times to ensure fresh image
+                rclpy.spin_once(self.grasp, timeout_sec=0.1)
+            img = self.grasp.image
+        else:
+            img = self.nav.get_image()
+            
+        if img is not None and self.detector:
+            print(f"   [Stage 1] Got image: {img.shape}")
+            detections = self.detector.detect(img)
+            blocks = detections.get('blocks', {})
+            
+            if blocks:
+                print(f"   [Stage 1] Found Blocks: {list(blocks.keys())}")
+                for color in blocks.keys():
+                    if color in ['orange', 'red', 'green', 'blue']:
+                        loc_info["cube_color"] = color
+                        print(f"   -> Found Block: {color}")
+            else:
+                print("   [Stage 1] No blocks detected.")
+        
+        # ============ STAGE 2: Tilt UP to scan for ZONE PICTURES ============
+        print(f"\n>> [Stage 2] Tilting camera UP for ZONE PICTURE detection...")
+        
+        # Store init position for later return
+        q_init_saved = None
+        if self.grasp:
             try:
-                current_q = self.grasp.get_joint_positions()
-                target_q = current_q.copy()
-                # Adjust joint 2 (index 2) upward by ~0.3 rad for a higher viewpoint
-                target_q[2] += 0.3
-                self.grasp.set_joint_positions(target_q, 1.0)
-                time.sleep(2.0)
+                # ROS spin to update joint states
+                rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                q_init_saved = self.grasp.get_joint_positions().copy()
+                print(f"   Current joint positions: {q_init_saved}")
+                
+                # Tilt camera up: adjust multiple joints for better view
+                target_q = q_init_saved.copy()
+                target_q[1] += 0.3   # Joint 2: lift arm up
+                target_q[2] -= 0.3   # Joint 3: tilt camera up
+                target_q[3] -= 0.3   # Joint 4: additional tilt up
+                
+                print(f"   Moving to tilted-up pose: {target_q}")
+                self.grasp.set_joint_positions(target_q, 1.5)
+                
+                # Wait for arm to move with spinning
+                for _ in range(30):  # 3초 동안 spin
+                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                
+                print(f"   Arm tilt complete.")
             except Exception as e:
-                print(f"   !! Failed to raise arm for scanning: {e}")
-
-        # 2. 스캔 Loop (Retry Logic)
+                print(f"   !! Failed to tilt camera up: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Scan for zone pictures with tilted camera
         max_retries = 2
         for attempt in range(max_retries + 1):
-            print(f">> Scanning {loc_key} (Attempt {attempt+1}/{max_retries+1})...")
-            time.sleep(5.0) # 로봇/카메라 안정화
+            print(f">> [Stage 2] Scanning for ZONE PICTURE (Attempt {attempt+1}/{max_retries+1})...")
+            time.sleep(3.0)
             
-            
-            # 3. 이미지 획득
-            img = self.nav.get_image()
+            # Use GraspingNode's image (same as working test code)
+            if self.grasp:
+                for _ in range(10):  # Spin multiple times to ensure fresh image
+                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                img = self.grasp.image
+            else:
+                img = self.nav.get_image()
+                
             if img is None:
                 print("!! No image received from camera.")
                 continue
 
-            # 4. NanoOWL 감지
+            print(f"   [Stage 2] Got image: {img.shape}")
             if self.detector:
                 detections = self.detector.detect(img)
-                # detections: {'blocks': {'red': {...}, ...}, 'zones': {1: {...}, ...}}
-                
-                blocks = detections.get('blocks', {})
                 zones = detections.get('zones', {})
                 
-                if blocks or zones:
-                    print(f"   Found Blocks: {list(blocks.keys())}, Zones: {list(zones.keys())}")
-                    
-                    # 블록 감지 결과 저장
-                    for color in blocks.keys():
-                        if color in ['orange', 'red', 'green', 'blue']:
-                            loc_info["cube_color"] = color
-                            print(f"   -> Found Block: {color}")
-                    
-                    # Zone 감지 결과 저장
+                if zones:
+                    print(f"   [Stage 2] Found Zones: {list(zones.keys())}")
                     for zone_id in zones.keys():
                         if zone_id in [1, 2, 3]:
                             loc_info["zone_id"] = zone_id
-                            print(f"   -> Found Zone: {zone_id}")
+                            loc_info["marker"] = detections['zones'][zone_id].get('marker')
+                            print(f"   -> Found Zone: {zone_id} (marker: {loc_info['marker']})")
                 else:
-                    print("   No relevant objects found.")
-            else:
-                print("!! NanoOwlDetector is not initialized.")
+                    print("   [Stage 2] No zone pictures detected.")
             
-            # 체크: Zone ID를 찾았는가?
+            # Check: Did we find Zone ID?
             if loc_info["zone_id"] is not None:
-                print("   Zone ID Confirmation: Success.")
+                print("   Zone ID Confirmation: Success!")
                 break
             
-            # 못 찾았다면 Retry
+            # If not found, try tilting more
             if attempt < max_retries:
-                print("   Zone ID MISSING. Adjusting Camera Angle (Tilt Up)...")
+                print("   Zone ID MISSING. Tilting camera UP more...")
                 if self.grasp:
-                    # Joint 4 (Index 3) Tilt Up (-0.2 rad approx)
                     try:
+                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
                         current_q = self.grasp.get_joint_positions()
                         target_q = current_q.copy()
-                        target_q[3] -= 0.2 
-                        print(f"   Move Joint 4: {current_q[3]:.2f} -> {target_q[3]:.2f}")
+                        target_q[3] -= 0.2  # Tilt up more
+                        print(f"   Tilting more: {target_q}")
                         self.grasp.set_joint_positions(target_q, 1.0)
-                        time.sleep(5.0)
+                        # Wait with spinning
+                        for _ in range(20):  # 2초 동안 spin
+                            rclpy.spin_once(self.grasp, timeout_sec=0.1)
                     except Exception as e:
                         print(f"   !! Tilt failed: {e}")
-                else:
-                    print("   !! GraspingNode unavailable. Cannot tilt.")
-                    break
         
-        # 5. 빈 공간 처리 (모든 시도 종료 후 블록 미발견 시)
-        # 단, 기존에 찾았을 수도 있으니 loc_info["cube_color"] 확인
+        # ============ STAGE 3: Return to INIT position before navigation ============
+        print(f"\n>> [Stage 3] Returning to INIT position...")
+        if self.grasp:
+            try:
+                rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                self.grasp.align_to_init(1.5)
+                # Wait with spinning
+                for _ in range(15):  # 1.5초 동안 spin
+                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                print("   Arm returned to init position.")
+            except Exception as e:
+                print(f"   !! Failed to return to init: {e}")
+        
+        # ============ FALLBACK: Apply default values if detection failed ============
+        # Zone ID fallback
+        if loc_info["zone_id"] is None:
+            default_zone = loc_info.get("default_zone_id")
+            if default_zone:
+                print(f"   ⚠️ Zone not detected. Using default: Zone {default_zone}")
+                loc_info["zone_id"] = default_zone
+                loc_info["marker"] = loc_info.get("default_marker")
+        
+        # Block color fallback
         if loc_info["cube_color"] is None:
-             print("   -> No block detected after scans. Marking as 'empty_spot'.")
-             loc_info["cube_color"] = "empty_spot"
+            default_color = loc_info.get("default_cube_color")
+            if default_color:
+                print(f"   ⚠️ Block not detected. Using default: {default_color}")
+                loc_info["cube_color"] = default_color
+            else:
+                print("   -> No block detected. Marking as 'empty_spot'.")
+                loc_info["cube_color"] = "empty_spot"
 
-        # 맵에 업데이트 반영
+        # Update world map
         self.world_map[loc_key] = loc_info
-        print(f"   Updated {loc_key}: {loc_info}")
+        print(f"   Updated {loc_key}: zone={loc_info['zone_id']}, color={loc_info['cube_color']}, marker={loc_info['marker']}")
 
     def generate_plan_from_llm(self, prompt):
         print(f">> LLM Generating Plan for: '{prompt}'")
@@ -713,9 +806,11 @@ class SmartMission:
                     # Find location with this zone
                     target_loc = self._find_location_by_zone(zone_num)
                     if target_loc:
-                        coords = self.world_map[target_loc]["coords"]
+                        loc_info = self.world_map[target_loc]
+                        coords = loc_info["coords"]
+                        yaw = loc_info.get("yaw")
                         print(f"   -> Navigating to {target} at {coords}")
-                        self.nav.move_to_coordinate(*coords)
+                        self.nav.move_to_coordinate(coords[0], coords[1], yaw=yaw)
                         try:
                             self.nav.move_forward(0.1)
                             time.sleep(1.0)
