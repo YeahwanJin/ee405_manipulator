@@ -5,6 +5,7 @@ import re
 import ast
 import json
 import requests
+import subprocess
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -30,6 +31,39 @@ if "API_KEY" not in os.environ:
 
 # Voice Server Configuration
 VOICE_SERVER_URL = "https://localhost:5000"
+
+# =============================================================================
+# COSTMAP CLEARING CONFIGURATION
+# Set to False if costmap clearing causes problems
+# =============================================================================
+ENABLE_COSTMAP_CLEAR = True
+
+def clear_costmaps():
+    """
+    Clear Nav2 costmaps to remove accumulated obstacles.
+    This helps when SLAM map walls appear to 'tighten' during navigation.
+    Toggle ENABLE_COSTMAP_CLEAR to disable if it causes issues.
+    """
+    if not ENABLE_COSTMAP_CLEAR:
+        return
+    
+    print(">> Clearing costmaps...")
+    try:
+        subprocess.run(
+            ['ros2', 'service', 'call', '/global_costmap/clear_entirely_global_costmap', 
+             'nav2_msgs/srv/ClearEntireCostmap', '{}'], 
+            capture_output=True, timeout=5
+        )
+        subprocess.run(
+            ['ros2', 'service', 'call', '/local_costmap/clear_entirely_local_costmap', 
+             'nav2_msgs/srv/ClearEntireCostmap', '{}'], 
+            capture_output=True, timeout=5
+        )
+        print(">> Costmaps cleared successfully!")
+    except subprocess.TimeoutExpired:
+        print(">> Costmap clear timed out (service may not be available)")
+    except Exception as e:
+        print(f">> Costmap clear failed: {e}")
 
 def get_voice_command(timeout=60):
     """
@@ -82,12 +116,14 @@ world_map = {
 "loc_2": {"zone_id": None, "cube_color": None},  # 두번째 방문할 곳
 "loc_3": {"zone_id": None, "cube_color": None}   # 안 가도 알 수 있는 곳
 }
+# Default task queue: Navigate to zone 2, pick the green block there, place at zone 3
+# Note: By default, zone_2 has green block (loc_2), zone_1 has blue block (loc_1), zone_3 is empty
 task_queue = [
-{"action": "pick", "target_color": "blue"},
-{"action": "place", "target_zone": 3},
-{"action": "pick", "target_color": "green"},
-{"action": "place", "target_zone": 2}
+    {"action": "navigate", "target": "zone_2"},
+    {"action": "pick", "target": "green_block"},
+    {"action": "place", "target": "zone_3"}
 ]
+# Note: Return to start is handled by Phase 4 automatically, no need in task_queue
 #
 
 # -------------------------------------------------------------
@@ -303,7 +339,7 @@ CX = 320.0
 CY = 240.0
 INTRINSICS = (FX, FY, CX, CY)
 
-OBJECTS = ["orange toy block", "red toy block", "green toy block", "blue toy block", "bird", "chair", "horse"]
+OBJECTS = ["red toy block", "green toy block", "blue toy block", "bird", "chair", "horse"]
 THRESHOLD = 0.1
 GRASP_SCORE_THRESHOLD = 0.1
 
@@ -493,14 +529,14 @@ class SmartMission:
                 "coords": (0.526938259601593, -1.097978115081787), 
                 "yaw": math.pi, 
                 "zone_id": None, "cube_color": None, "marker": None,
-                "default_zone_id": 2, "default_cube_color": "green", "default_marker": "chair"
+                "default_zone_id": 2, "default_cube_color": "green", "default_marker": "horse"
             },
             # Zone 3: Face 180° (backward) - Default: zone_3, empty (red block not here)
             "loc_3": {
                 "coords": (0.980643630027771, 1.1787939071655273), 
                 "yaw": math.pi, 
                 "zone_id": None, "cube_color": None, "marker": None,
-                "default_zone_id": 3, "default_cube_color": "empty_spot", "default_marker": "horse"
+                "default_zone_id": 3, "default_cube_color": "empty_spot", "default_marker": "bird"
             }
         }
         self.task_queue = task_queue
@@ -541,31 +577,108 @@ class SmartMission:
         print("\n--- [Phase 1] Start Smart Exploration ---")
         search_order = ["loc_1", "loc_2", "loc_3"]
         
-        for key in search_order:
-            self.visit_and_scan(key)
+        # Track detection results: (zone_detected, block_detected) for each location
+        # Note: There are only 2 blocks, so one location will have no block (expected)
+        detection_results = {}
         
-        # Build dynamic state from exploration
+        for key in search_order:
+            detection_results[key] = self.visit_and_scan(key)
+        
+        # Check detection success:
+        # - ALL 3 zones must be detected
+        # - Exactly 2 blocks should be detected (one location will be empty)
+        zones_detected = sum(1 for (zone, block) in detection_results.values() if zone)
+        blocks_detected = sum(1 for (zone, block) in detection_results.values() if block)
+        
+        all_zones_detected = (zones_detected == 3)
+        expected_blocks_detected = (blocks_detected == 2)  # Only 2 blocks exist
+        
+        all_detections_succeeded = all_zones_detected and expected_blocks_detected
+        
+        print(f"\n>> Detection Summary: {zones_detected}/3 zones, {blocks_detected}/2 blocks")
+        
+        if all_detections_succeeded:
+            print("✓ All detections succeeded! Proceeding with detected state.")
+        else:
+            # Detection failed - identify what's missing
+            if not all_zones_detected:
+                failed_zones = [k for k, (z, b) in detection_results.items() if not z]
+                print(f"⚠️ Zone detection failed at: {failed_zones}")
+            if not expected_blocks_detected:
+                print(f"⚠️ Expected 2 blocks, detected {blocks_detected}")
+            print("⚠️ Applying DEFAULT settings to ALL locations and using DEFAULT plan...")
+            
+            self._apply_all_defaults()
+        
+        # Build dynamic state from exploration (or defaults)
         self._build_dynamic_state()
 
         # [Step 3] Generate Plan with LLM using dynamic state
         print("\n--- [Phase 2] Generate Plan with LLM ---")
-        if self.planner:
-            self.task_queue = self.planner.generate_plan(
-                user_prompt, 
-                self.discovered_map, 
-                self.discovered_blocks
-            )
+        
+        if not all_detections_succeeded:
+            # Detection failed - use default task queue
+            print(">> Using default task queue due to detection failure.")
+            self.task_queue = task_queue  # Use global default task_queue
+            print(f">> Default Plan: {json.dumps(self.task_queue, indent=2)}")
+        elif self.planner:
+            try:
+                self.task_queue = self.planner.generate_plan(
+                    user_prompt, 
+                    self.discovered_map, 
+                    self.discovered_blocks
+                )
+                if not self.task_queue:
+                    print("!! LLM returned empty plan. Using default task queue.")
+                    self.task_queue = task_queue
+                else:
+                    print(f">> Generated Plan: {json.dumps(self.task_queue, indent=2)}")
+            except Exception as e:
+                print(f"!! LLM Planning failed with error: {e}")
+                print(">> Falling back to default task queue.")
+                self.task_queue = task_queue
         else:
             print("!! LLMPlanner not available, using default queue")
+            self.task_queue = task_queue
         
-        if not self.task_queue:
-            print("!! No valid plan generated. Using default task queue.")
-        else:
-            print(f">> Generated Plan: {json.dumps(self.task_queue, indent=2)}")
+        print(f">> Final Task Queue: {json.dumps(self.task_queue, indent=2)}")
         
         # [Step 4] Phase 3: Execution
         print("\n--- [Phase 3] Execution ---")
+        clear_costmaps()  # Clear accumulated obstacles before execution
         self.run_phase_2_execution()
+        
+        # [Step 5] Return to Initial Point
+        print("\n--- [Phase 4] Returning to Initial Point ---")
+        clear_costmaps()  # Clear costmaps before final navigation
+        print(">> Navigating back to start position (0, 0)...")
+        self.grasp.align_to_init(1.5)
+        success = self.nav.move_to_coordinate(0.0, 0.0, yaw=0.0)
+        
+        if success:
+            print(">> Successfully returned to initial point!")
+        else:
+            print("!! Failed to return to initial point.")
+    
+    def _apply_all_defaults(self):
+        """Apply default values to ALL locations when any detection fails."""
+        print(">> Resetting ALL locations to default values...")
+        
+        for loc_key, loc_info in self.world_map.items():
+            default_zone = loc_info.get("default_zone_id")
+            default_color = loc_info.get("default_cube_color")
+            default_marker = loc_info.get("default_marker")
+            
+            if default_zone:
+                loc_info["zone_id"] = default_zone
+            if default_marker:
+                loc_info["marker"] = default_marker
+            if default_color:
+                loc_info["cube_color"] = default_color
+            else:
+                loc_info["cube_color"] = "empty_spot"
+            
+            print(f"   {loc_key}: zone={loc_info['zone_id']}, color={loc_info['cube_color']}, marker={loc_info['marker']}")
     
     def _build_dynamic_state(self):
         """Build discovered_map and discovered_blocks from world_map."""
@@ -596,11 +709,12 @@ class SmartMission:
     
     def visit_and_scan(self, loc_key):
         """
-        Two-stage scanning approach:
+        Two-stage scanning approach with backup retry:
         1. Navigate to location
         2. Scan for BLOCKS in init position (good for cube detection)
         3. Tilt camera UP to scan for ZONE PICTURES (bird/chair/horse)
-        4. Return to init position before navigating to next location
+        4. If detection fails, move backward and retry once
+        5. Return to init position before navigating to next location
         """
         loc_info = self.world_map[loc_key]
         x, y = loc_info["coords"]
@@ -616,199 +730,236 @@ class SmartMission:
         # MPPI로 도착 후 cmd_vel로 10cm 추가 전진
         print(f"   >> Moving forward 10cm closer to block...")
         try:
-            self.nav.move_forward(0.3)  # 10cm = 0.1m
+            self.nav.move_forward(0.2)  # 10cm = 0.1m
             time.sleep(1.0)
         except Exception as e:
             print(f"   !! Failed to move forward 10cm: {e}")
-            
-        # ============ STAGE 1: Scan for BLOCKS with multi-tilt retry ============
-        # 시도 순서: 초기 위치 -> tilt 1 -> tilt 2 -> tilt 3 -> 초기 위치로 복귀
-        detected_block = None
         
-        if self.grasp:
-            print("   [Stage 1] Starting multi-tilt BLOCK detection...")
-            rclpy.spin_once(self.grasp, timeout_sec=0.1)
-            self.grasp.align_to_init(1.5)
-            time.sleep(1.5)
-            
-            # 초기 위치 저장
-            q_init_saved = self.grasp.get_joint_positions().copy()
-            
-            # Tilt 설정: [(joint2_delta, joint3_delta), ...]
-            tilt_configs = [
-                (0.0, 0.0),    # 시도 1: 초기 위치
-                (0.2, -0.15),  # 시도 2: 약간 위로
-                (0.4, -0.25),  # 시도 3: 더 위로
-            ]
-            
-            for attempt, (j2_delta, j3_delta) in enumerate(tilt_configs):
-                print(f"\n   [Stage 1] Block detection attempt {attempt+1}/3 (j2+={j2_delta}, j3+={j3_delta})...")
-                
+        # ============ DETECTION WITH BACKUP RETRY ============
+        # Try detection at current position, if fails, move backward and retry once
+        max_distance_retries = 2  # Original position + 1 backup (after moving backward)
+        
+        for distance_attempt in range(max_distance_retries):
+            if distance_attempt > 0:
+                # Move backward for retry
+                print(f"\n   ⚠️ [BACKUP RETRY] Detection incomplete, moving backward 15cm and retrying...")
                 try:
-                    q_tilted = q_init_saved.copy()
-                    q_tilted[1] += j2_delta  # Joint 2
-                    q_tilted[2] += j3_delta  # Joint 3
-                    self.grasp.set_joint_positions(q_tilted, 1.0)
-                    for _ in range(12):  # Wait 1.2s with spin
-                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                    self.nav.move_forward(-0.15)  # Move backward 15cm
+                    time.sleep(1.0)
                 except Exception as e:
-                    print(f"   !! Tilt failed: {e}")
-                    continue
-                
-                time.sleep(1.0)  # Camera stabilization
-                
-                # Get fresh image
-                for _ in range(10):
-                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
-                img = self.grasp.image
-                
-                if img is not None and self.detector:
-                    print(f"   [Stage 1] Got image: {img.shape}")
-                    detections = self.detector.detect(img.copy())
-                    blocks = detections.get('blocks', {})
-                    
-                    if blocks:
-                        print(f"   [Stage 1] Found Blocks: {list(blocks.keys())}")
-                        for color in blocks.keys():
-                            if color in ['orange', 'red', 'green', 'blue']:
-                                detected_block = color
-                                loc_info["cube_color"] = color
-                                print(f"   -> Found Block: {color}")
-                        break  # 감지 성공, 루프 종료
-                    else:
-                        print("   [Stage 1] No blocks detected at this angle.")
+                    print(f"   !! Failed to move backward: {e}")
+                    break
             
-            # 초기 위치로 복귀
-            print("   [Stage 1] Returning to init position...")
-            self.grasp.set_joint_positions(q_init_saved, 1.0)
-            for _ in range(12):
-                rclpy.spin_once(self.grasp, timeout_sec=0.1)
-        
-        if detected_block is None:
-            print("   [Stage 1] Block detection FAILED after all attempts.")
-        
-        # ============ STAGE 2: Tilt UP to scan for ZONE PICTURES ============
-        print(f"\n>> [Stage 2] Tilting camera UP for ZONE PICTURE detection...")
-        
-        # Store init position for later return
-        q_init_saved = None
-        if self.grasp:
-            try:
-                # ROS spin to update joint states
-                rclpy.spin_once(self.grasp, timeout_sec=0.1)
-                q_init_saved = self.grasp.get_joint_positions().copy()
-                print(f"   Current joint positions: {q_init_saved}")
-                
-                # Tilt camera up: adjust multiple joints for better view
-                target_q = q_init_saved.copy()
-                target_q[1] += 0.3   # Joint 2: lift arm up
-                target_q[2] -= 0.3   # Joint 3: tilt camera up
-                target_q[3] -= 0.3   # Joint 4: additional tilt up
-                
-                print(f"   Moving to tilted-up pose: {target_q}")
-                self.grasp.set_joint_positions(target_q, 1.5)
-                
-                # Wait for arm to move with spinning
-                for _ in range(30):  # 3초 동안 spin
-                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
-                
-                print(f"   Arm tilt complete.")
-            except Exception as e:
-                print(f"   !! Failed to tilt camera up: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # Scan for zone pictures with tilted camera
-        max_retries = 2
-        for attempt in range(max_retries + 1):
-            print(f">> [Stage 2] Scanning for ZONE PICTURE (Attempt {attempt+1}/{max_retries+1})...")
-            time.sleep(3.0)
+            print(f"\n   === Detection Attempt {distance_attempt + 1}/{max_distance_retries} ===")
             
-            # Use GraspingNode's image (same as working test code)
+            # ============ STAGE 1: Scan for BLOCKS with multi-tilt retry ============
+            # 시도 순서: 초기 위치 -> tilt 1 -> tilt 2 -> tilt 3 -> 초기 위치로 복귀
+            detected_block = None
+            
             if self.grasp:
-                for _ in range(10):  # Spin multiple times to ensure fresh image
-                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
-                img = self.grasp.image
-            else:
-                img = self.nav.get_image()
+                print("   [Stage 1] Starting multi-tilt BLOCK detection...")
+                rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                self.grasp.align_to_init(1.5)
+                time.sleep(1.5)
                 
-            if img is None:
-                print("!! No image received from camera.")
-                continue
-
-            print(f"   [Stage 2] Got image: {img.shape}")
-            if self.detector:
-                # Copy image to make it writable (fixes PyTorch tensor warning)
-                detections = self.detector.detect(img.copy())
-                zones = detections.get('zones', {})
+                # 초기 위치 저장
+                q_init_saved = self.grasp.get_joint_positions().copy()
                 
-                if zones:
-                    print(f"   [Stage 2] Found Zones: {list(zones.keys())}")
-                    for zone_id in zones.keys():
-                        if zone_id in [1, 2, 3]:
-                            loc_info["zone_id"] = zone_id
-                            loc_info["marker"] = detections['zones'][zone_id].get('marker')
-                            print(f"   -> Found Zone: {zone_id} (marker: {loc_info['marker']})")
-                else:
-                    print("   [Stage 2] No zone pictures detected.")
-            
-            # Check: Did we find Zone ID?
-            if loc_info["zone_id"] is not None:
-                print("   Zone ID Confirmation: Success!")
-                break
-            
-            # If not found, try tilting more
-            if attempt < max_retries:
-                print("   Zone ID MISSING. Tilting camera UP more...")
-                if self.grasp:
+                # Tilt 설정: [(joint2_delta, joint3_delta, joint0_delta), ...]
+                # 초기 위치가 가장 적절하므로, 큰 변화 없이 다양한 방향으로 조금씩 조정
+                tilt_configs = [
+                    (0.0, 0.0, 0.0),      # 시도 1: 초기 위치 (가장 적절)
+                    (0.1, -0.1, 0.0),     # 시도 2: 약간 위로
+                    (-0.2, 0.2, 0.0),     # 시도 3: 약간 아래로
+                    (0.0, 0.0, 0.15),     # 시도 4: 약간 왼쪽으로
+                    (0.0, 0.0, -0.15),    # 시도 5: 약간 오른쪽으로
+                ]
+                
+                for attempt, (j2_delta, j3_delta, j0_delta) in enumerate(tilt_configs):
+                    print(f"\n   [Stage 1] Block detection attempt {attempt+1}/{len(tilt_configs)} (j2+={j2_delta}, j3+={j3_delta}, j0+={j0_delta})...")
+                    
                     try:
-                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
-                        current_q = self.grasp.get_joint_positions()
-                        target_q = current_q.copy()
-                        target_q[3] -= 0.2  # Tilt up more
-                        print(f"   Tilting more: {target_q}")
-                        self.grasp.set_joint_positions(target_q, 1.0)
-                        # Wait with spinning
-                        for _ in range(20):  # 2초 동안 spin
+                        q_tilted = q_init_saved.copy()
+                        q_tilted[0] += j0_delta  # Joint 0: base rotation (left/right)
+                        q_tilted[1] += j2_delta  # Joint 2
+                        q_tilted[2] += j3_delta  # Joint 3
+                        self.grasp.set_joint_positions(q_tilted, 1.0)
+                        for _ in range(12):  # Wait 1.2s with spin
                             rclpy.spin_once(self.grasp, timeout_sec=0.1)
                     except Exception as e:
                         print(f"   !! Tilt failed: {e}")
-        
-        # ============ STAGE 3: Return to INIT position before navigation ============
-        print(f"\n>> [Stage 3] Returning to INIT position...")
-        if self.grasp:
-            try:
-                rclpy.spin_once(self.grasp, timeout_sec=0.1)
-                self.grasp.align_to_init(1.5)
-                # Wait with spinning
-                for _ in range(15):  # 1.5초 동안 spin
+                        continue
+                    
+                    time.sleep(1.0)  # Camera stabilization
+                    
+                    # Get fresh image
+                    for _ in range(10):
+                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                    img = self.grasp.image
+                    
+                    if img is not None and self.detector:
+                        print(f"   [Stage 1] Got image: {img.shape}")
+                        detections = self.detector.detect(img.copy())
+                        blocks = detections.get('blocks', {})
+                        
+                        if blocks:
+                            print(f"   [Stage 1] Found Blocks: {list(blocks.keys())}")
+                            # Only take the FIRST valid block (one block per zone)
+                            for color in blocks.keys():
+                                if color in ['orange', 'red', 'green', 'blue']:
+                                    detected_block = color
+                                    loc_info["cube_color"] = color
+                                    print(f"   -> Found Block: {color} (selecting first valid block)")
+                                    break  # Only one block per zone
+                            break  # 감지 성공, 루프 종료
+                        else:
+                            print("   [Stage 1] No blocks detected at this angle.")
+                
+                # 초기 위치로 복귀
+                print("   [Stage 1] Returning to init position...")
+                self.grasp.set_joint_positions(q_init_saved, 1.0)
+                for _ in range(12):
                     rclpy.spin_once(self.grasp, timeout_sec=0.1)
-                print("   Arm returned to init position.")
-            except Exception as e:
-                print(f"   !! Failed to return to init: {e}")
-        
-        # ============ FALLBACK: Apply default values if detection failed ============
-        # Zone ID fallback
-        if loc_info["zone_id"] is None:
-            default_zone = loc_info.get("default_zone_id")
-            if default_zone:
-                print(f"   ⚠️ Zone not detected. Using default: Zone {default_zone}")
-                loc_info["zone_id"] = default_zone
-                loc_info["marker"] = loc_info.get("default_marker")
-        
-        # Block color fallback
-        if loc_info["cube_color"] is None:
-            default_color = loc_info.get("default_cube_color")
-            if default_color:
-                print(f"   ⚠️ Block not detected. Using default: {default_color}")
-                loc_info["cube_color"] = default_color
-            else:
-                print("   -> No block detected. Marking as 'empty_spot'.")
-                loc_info["cube_color"] = "empty_spot"
+            
+            if detected_block is None:
+                print("   [Stage 1] Block detection FAILED after all attempts.")
+            
+            # ============ STAGE 2: Multi-tilt scan for ZONE PICTURES ============
+            print(f"\n>> [Stage 2] Multi-tilt ZONE PICTURE detection...")
+            
+            # Store init position for later return
+            q_init_saved = None
+            if self.grasp:
+                try:
+                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                    q_init_saved = self.grasp.get_joint_positions().copy()
+                    print(f"   Current joint positions: {q_init_saved}")
+                except Exception as e:
+                    print(f"   !! Failed to get init position: {e}")
+            
+            # Zone tilt configurations: (j2_delta, j3_delta, j4_delta, j0_delta)
+            # 초기 위치에서 크게 벗어나지 않도록 작은 조정
+            zone_tilt_configs = [
+                (0.15, -0.15, -0.1, 0.0),    # 시도 1: 약간 위로
+                (0.1, -0.1, 0.0, 0.0),       # 시도 2: 조금만 위로
+                (0.15, -0.1, -0.1, 0.15),    # 시도 3: 약간 위 + 왼쪽
+                (0.15, -0.1, -0.1, -0.15),   # 시도 4: 약간 위 + 오른쪽
+                (0.2, -0.2, -0.15, 0.0),     # 시도 5: 조금 더 위로
+            ]
+            
+            for attempt, (j2_d, j3_d, j4_d, j0_d) in enumerate(zone_tilt_configs):
+                print(f">> [Stage 2] Zone detection attempt {attempt+1}/{len(zone_tilt_configs)} (j2+={j2_d}, j3+={j3_d}, j4+={j4_d}, j0+={j0_d})...")
+                
+                if self.grasp and q_init_saved is not None:
+                    try:
+                        target_q = q_init_saved.copy()
+                        target_q[0] += j0_d   # Joint 0: base rotation
+                        target_q[1] += j2_d   # Joint 2: lift arm
+                        target_q[2] += j3_d   # Joint 3: tilt
+                        target_q[3] += j4_d   # Joint 4: additional tilt
+                        
+                        self.grasp.set_joint_positions(target_q, 1.0)
+                        for _ in range(15):  # Wait 1.5s with spin
+                            rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                    except Exception as e:
+                        print(f"   !! Tilt failed: {e}")
+                        continue
+                
+                time.sleep(1.5)  # Camera stabilization
+                
+                # Get fresh image
+                if self.grasp:
+                    for _ in range(10):
+                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                    img = self.grasp.image
+                else:
+                    img = self.nav.get_image()
+                    
+                if img is None:
+                    print("   !! No image received from camera.")
+                    continue
 
+                print(f"   [Stage 2] Got image: {img.shape}")
+                if self.detector:
+                    detections = self.detector.detect(img.copy())
+                    zones = detections.get('zones', {})
+                    
+                    if zones:
+                        print(f"   [Stage 2] Found Zones: {list(zones.keys())}")
+                        
+                        # Priority: Prefer bird/horse over chair (only use chair if it's the only one)
+                        valid_zones = {zid: info for zid, info in zones.items() if zid in [1, 2, 3]}
+                        
+                        if valid_zones:
+                            # Separate chair (zone 2) from others
+                            non_chair_zones = {zid: info for zid, info in valid_zones.items() if info.get('marker') != 'chair'}
+                            chair_zones = {zid: info for zid, info in valid_zones.items() if info.get('marker') == 'chair'}
+                            
+                            # Prefer non-chair (bird/horse) if available
+                            if non_chair_zones:
+                                selected_zone_id = list(non_chair_zones.keys())[0]
+                                selected_marker = non_chair_zones[selected_zone_id].get('marker')
+                                print(f"   -> Preferring non-chair marker: {selected_marker}")
+                            elif chair_zones:
+                                # Only use chair if it's the only detection
+                                selected_zone_id = list(chair_zones.keys())[0]
+                                selected_marker = 'chair'
+                                print(f"   -> Only chair detected, using chair")
+                            else:
+                                selected_zone_id = None
+                                selected_marker = None
+                            
+                            if selected_zone_id:
+                                loc_info["zone_id"] = selected_zone_id
+                                loc_info["marker"] = selected_marker
+                                print(f"   -> Selected Zone: {selected_zone_id} (marker: {selected_marker})")
+                    else:
+                        print("   [Stage 2] No zone pictures detected.")
+                
+                # Check: Did we find Zone ID?
+                if loc_info["zone_id"] is not None:
+                    print("   Zone ID Confirmation: Success!")
+                    break
+            
+            # ============ STAGE 3: Return to INIT position before navigation ============
+            print(f"\n>> [Stage 3] Returning to INIT position...")
+            if self.grasp:
+                try:
+                    rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                    self.grasp.align_to_init(1.5)
+                    # Wait with spinning
+                    for _ in range(15):  # 1.5초 동안 spin
+                        rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                    print("   Arm returned to init position.")
+                except Exception as e:
+                    print(f"   !! Failed to return to init: {e}")
+            
+            # Check if both detections succeeded - if so, no need for retry
+            if loc_info.get("cube_color") is not None and loc_info.get("zone_id") is not None:
+                print(f"   ✓ Detection successful! Block: {loc_info['cube_color']}, Zone: {loc_info['zone_id']}")
+                break
+            elif distance_attempt < max_distance_retries - 1:
+                print(f"   Detection incomplete (block: {loc_info.get('cube_color')}, zone: {loc_info.get('zone_id')}), will retry at different distance...")
+        
+        # ============ DETERMINE DETECTION SUCCESS ============
+        # Return tuple: (zone_detected, block_detected)
+        # Note: block_detected can be False for one location (only 2 blocks exist)
+        block_detected = loc_info.get("cube_color") is not None
+        zone_detected = loc_info.get("zone_id") is not None
+        
+        # Mark empty spot if no block detected (this is expected for 1 location)
+        if not block_detected:
+            loc_info["cube_color"] = "empty_spot"
+        
         # Update world map
         self.world_map[loc_key] = loc_info
-        print(f"   Updated {loc_key}: zone={loc_info['zone_id']}, color={loc_info['cube_color']}, marker={loc_info['marker']}")
+        
+        # Print status
+        zone_status = "✓" if zone_detected else "✗"
+        block_status = "✓" if block_detected else "(empty)"
+        print(f"   {loc_key}: Zone {zone_status}, Block {block_status} - zone={loc_info['zone_id']}, color={loc_info['cube_color']}, marker={loc_info.get('marker')}")
+        
+        return (zone_detected, block_detected)
 
     def generate_plan_from_llm(self, prompt):
         print(f">> LLM Generating Plan for: '{prompt}'")
@@ -901,12 +1052,14 @@ class SmartMission:
                 target_loc = self._find_location_by_color(color)
                 
                 if target_loc:
-                    coords = self.world_map[target_loc]["coords"]
+                    loc_info = self.world_map[target_loc]
+                    coords = loc_info["coords"]
+                    yaw = loc_info.get("yaw")
                     print(f"   -> Found {color} at {target_loc} {coords}")
                     
                     # ICP-based Grasp with multi-tilt retry
                     if self.detector and self.grasp:
-                        # [Phase 2] 블록 감지: 초기 위치에서 시작, 3번 tilt 시도 후 복귀
+                        # [Phase 2] 블록 감지: 초기 위치에서 시작, 여러 tilt 시도 후 복귀
                         print(f"   -> Starting multi-tilt block detection for {color}...")
                         rclpy.spin_once(self.grasp, timeout_sec=0.1)
                         self.grasp.align_to_init(1.5)
@@ -915,20 +1068,24 @@ class SmartMission:
                         # 초기 위치 저장
                         q_init_saved = self.grasp.get_joint_positions().copy()
                         
-                        # Tilt 설정: [(joint2_delta, joint3_delta), ...]
+                        # Tilt 설정: [(joint2_delta, joint3_delta, joint0_delta), ...]
+                        # 초기 위치가 가장 적절하므로, 큰 변화 없이 다양한 방향으로 조금씩 조정
                         tilt_configs = [
-                            (0.0, 0.0),    # 시도 1: 초기 위치
-                            (0.2, -0.15),  # 시도 2: 약간 위로
-                            (0.4, -0.25),  # 시도 3: 더 위로
+                            (0.0, 0.0, 0.0),      # 시도 1: 초기 위치 (가장 적절)
+                            (0.1, -0.1, 0.0),     # 시도 2: 약간 위로
+                            (-0.2, 0.2, 0.0),     # 시도 3: 약간 아래로
+                            (0.0, 0.0, 0.15),     # 시도 4: 약간 왼쪽으로
+                            (0.0, 0.0, -0.15),    # 시도 5: 약간 오른쪽으로
                         ]
                         
                         T_world_block = None
                         
-                        for attempt, (j2_delta, j3_delta) in enumerate(tilt_configs):
-                            print(f"\n   [Pick] Block detection attempt {attempt+1}/3 (j2+={j2_delta}, j3+={j3_delta})...")
+                        for attempt, (j2_delta, j3_delta, j0_delta) in enumerate(tilt_configs):
+                            print(f"\n   [Pick] Block detection attempt {attempt+1}/{len(tilt_configs)} (j2+={j2_delta}, j3+={j3_delta}, j0+={j0_delta})...")
                             
                             try:
                                 q_tilted = q_init_saved.copy()
+                                q_tilted[0] += j0_delta  # Joint 0: base rotation (left/right)
                                 q_tilted[1] += j2_delta  # Joint 2
                                 q_tilted[2] += j3_delta  # Joint 3
                                 self.grasp.set_joint_positions(q_tilted, 1.0)
@@ -967,16 +1124,60 @@ class SmartMission:
                             rclpy.spin_once(self.grasp, timeout_sec=0.1)
                         
                         # Grasp 실행
+                        grasp_success = False
+                        
                         if T_world_block is not None:
                             print(f"   -> Executing ICP-based Grasp...")
-                            success = self.grasp.grasp_pose(T_world_block)
-                            if success:
+                            grasp_success = self.grasp.grasp_pose(T_world_block)
+                            if grasp_success:
                                 print("      Grasp Success!")
                                 holding_color = color
                             else:
-                                print("      Grasp Failed!")
+                                print("      Grasp Failed (IK failed).")
                         else:
-                            print(f"   !! Could not detect {color} block after all attempts")
+                            print(f"   !! Could not detect {color} block after all attempts.")
+                        
+                        # ============ HARDCODED FALLBACK GRASP ============
+                        # Execute fallback if detection failed OR ICP grasp failed
+                        if not grasp_success:
+                            print("      Trying HARDCODED FALLBACK GRASP...")
+                            try:
+                                rclpy.spin_once(self.grasp, timeout_sec=0.1)
+                                
+                                # 1) 그리퍼 열기
+                                self.grasp.gripper_open(0.5)
+                                time.sleep(0.5)
+                                
+                                # 2) 아래로 내리기 (하드코딩된 위치)
+                                q_down = self.grasp.q_init.copy()
+                                q_down[1] += 1.4   # Joint 2: 앞으로 뻗기
+                                q_down[2] -= 0.8   # Joint 3: 아래로 기울이기
+                                q_down[3] -= 0.5   # Joint 4: 추가 기울이기
+                                print(f"      [Fallback] Moving to hardcoded DOWN pose: {q_down}")
+                                self.grasp.set_joint_positions(q_down, 2.0)
+                                time.sleep(2.0)
+                                
+                                # 3) 그리퍼 닫기 (집기)
+                                print("      [Fallback] Closing gripper...")
+                                self.grasp.gripper_close(0.8)
+                                time.sleep(0.5)
+                                
+                                # 4) 위로 들어올리기
+                                q_up = self.grasp.q_init.copy()
+                                q_up[1] += 0.2   # 약간 앞으로만
+                                print(f"      [Fallback] Lifting to: {q_up}")
+                                self.grasp.set_joint_positions(q_up, 1.5)
+                                time.sleep(1.5)
+                                
+                                # 5) init_q로 복귀
+                                print("      [Fallback] Returning to init position...")
+                                self.grasp.align_to_init(1.5)
+                                time.sleep(1.5)
+                                
+                                print("      [Fallback] Hardcoded grasp complete!")
+                                holding_color = color
+                            except Exception as fallback_err:
+                                print(f"      [Fallback] Failed: {fallback_err}")
                     else:
                         print("   !! Detector or Grasp node not available")
                 else:
